@@ -1,0 +1,8 @@
+RTSP_URL: "rtsp://pyuser:yacine03041973@192.168.1.70:554/cam/realmonitor?channel=1&subtype=0"
+cosine_threshold: 0.60
+skip_n: 2
+imgsz: [640, 360]
+db_path: "./identities.db"
+faces_dir: "./faces"
+http_port: 8080
+cache_seconds: 30
