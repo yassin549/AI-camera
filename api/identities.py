@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +25,9 @@ class RenameIdentityBody(BaseModel):
 
 class MergeIdentityBody(BaseModel):
     target_id: int
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
 
 
 def _ensure_authorized(request: Request) -> None:
@@ -55,6 +59,24 @@ def _table_exists(conn: sqlite3.Connection, table_name: str) -> bool:
         (table_name,),
     ).fetchone()
     return bool(row)
+
+
+def _ensure_identity_samples_table(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identity_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            identity_id INTEGER NOT NULL,
+            sample_path TEXT NOT NULL,
+            sample_type TEXT NOT NULL DEFAULT 'face',
+            created_ts TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_identity_samples_unique ON identity_samples(identity_id, sample_path)"
+    )
+    conn.commit()
 
 
 def _ensure_name_column(conn: sqlite3.Connection, columns: Set[str]) -> Set[str]:
@@ -165,29 +187,47 @@ def _load_extra_samples(
     identity_id: int,
     media_root: Path,
 ) -> Tuple[List[str], List[str]]:
+    _ensure_identity_samples_table(conn)
+    rows_identity_samples = conn.execute(
+        """
+        SELECT sample_path, sample_type
+        FROM identity_samples
+        WHERE identity_id=?
+        ORDER BY id DESC
+        """,
+        (identity_id,),
+    ).fetchall()
+    face_samples: List[str] = []
+    body_samples: List[str] = []
+    for row in rows_identity_samples:
+        sample_url = _path_to_media_url(row["sample_path"], media_root)
+        if not sample_url:
+            continue
+        sample_type = str(row["sample_type"] or "").lower()
+        if "body" in sample_type:
+            body_samples.append(sample_url)
+        else:
+            face_samples.append(sample_url)
+
     if not _table_exists(conn, "samples"):
-        return [], []
+        return face_samples, body_samples
     cols = _table_columns(conn, "samples")
     identity_col = "identity_id" if "identity_id" in cols else ("id_identity" if "id_identity" in cols else None)
     path_col = "path" if "path" in cols else ("sample_path" if "sample_path" in cols else "file_path" if "file_path" in cols else None)
     type_col = "sample_type" if "sample_type" in cols else ("type" if "type" in cols else "modality" if "modality" in cols else None)
-    if identity_col is None or path_col is None:
-        return [], []
-
-    type_expr = type_col if type_col is not None else "NULL"
-    query = f"SELECT {path_col} AS sample_path, {type_expr} AS sample_type FROM samples WHERE {identity_col}=?"
-    rows = conn.execute(query, (identity_id,)).fetchall()
-    face_samples: List[str] = []
-    body_samples: List[str] = []
-    for row in rows:
-        sample_url = _path_to_media_url(row["sample_path"], media_root)
-        if not sample_url:
-            continue
-        kind = str(row["sample_type"] or "").lower()
-        if "body" in kind:
-            body_samples.append(sample_url)
-        else:
-            face_samples.append(sample_url)
+    if identity_col is not None and path_col is not None:
+        type_expr = type_col if type_col is not None else "NULL"
+        query = f"SELECT {path_col} AS sample_path, {type_expr} AS sample_type FROM samples WHERE {identity_col}=?"
+        rows = conn.execute(query, (identity_id,)).fetchall()
+        for row in rows:
+            sample_url = _path_to_media_url(row["sample_path"], media_root)
+            if not sample_url:
+                continue
+            kind = str(row["sample_type"] or "").lower()
+            if "body" in kind:
+                body_samples.append(sample_url)
+            else:
+                face_samples.append(sample_url)
     return face_samples, body_samples
 
 
@@ -256,10 +296,12 @@ def _row_to_payload(
 
     payload: Dict[str, Any] = {
         "id": identity_id,
+        "display_name": str(row["name"] or f"Identity {identity_id}"),
         "name": str(row["name"] or f"Identity {identity_id}"),
         "first_seen": _format_iso(row["first_seen"]),
         "last_seen": _format_iso(row["last_seen"]),
         "frequency": int(row["frequency"] or 0),
+        "sample_images": sorted(set(face_samples + body_samples)),
         "face_samples": face_samples,
         "body_samples": body_samples,
     }
@@ -289,6 +331,114 @@ def _remove_samples(paths: Sequence[Optional[str]], media_root: Path) -> None:
                     resolved.unlink()
                 except Exception:
                     LOGGER.warning("Failed to delete sample file: %s", resolved, exc_info=True)
+
+
+def _guess_identity_id_from_path(path: Path) -> Optional[int]:
+    name = path.stem.lower()
+    patterns = [
+        r"^(\d+)_",
+        r"^identity[_-]?(\d+)",
+        r"^id[_-]?(\d+)",
+        r".*[_-](\d+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, name)
+        if match:
+            try:
+                return int(match.group(1))
+            except Exception:
+                return None
+    parent = path.parent.name
+    if parent.isdigit():
+        return int(parent)
+    return None
+
+
+def _upsert_identity_sample(
+    conn: sqlite3.Connection,
+    identity_id: int,
+    rel_path: str,
+    sample_type: str,
+) -> bool:
+    _ensure_identity_samples_table(conn)
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO identity_samples(identity_id, sample_path, sample_type, created_ts)
+        VALUES (?, ?, ?, ?)
+        """,
+        (identity_id, rel_path, sample_type, datetime.now(timezone.utc).isoformat()),
+    )
+    return cur.rowcount > 0
+
+
+def run_reindex(runtime: Any) -> Dict[str, int]:
+    media_root = runtime.media_root.resolve()
+    face_dirs = [
+        media_root / "faces",
+        media_root / "data" / "faces",
+        media_root / "samples" / "faces",
+    ]
+    body_dirs = [
+        media_root / "faces" / "body",
+        media_root / "body",
+        media_root / "bodies",
+        media_root / "data" / "bodies",
+        media_root / "samples" / "bodies",
+    ]
+    identity_dirs = [
+        media_root / "identities",
+        media_root / "data" / "identities",
+        media_root / "samples" / "identities",
+    ]
+
+    report = {"added": 0, "linked": 0, "orphans": 0}
+    try:
+        with _db_connect(runtime.db_path) as conn:
+            columns = _table_columns(conn, "identities")
+            identity_ids = {int(row["id"]) for row in conn.execute("SELECT id FROM identities").fetchall()}
+            _ensure_identity_samples_table(conn)
+
+            scans: List[Tuple[Path, str]] = []
+            scans.extend((d, "face") for d in face_dirs)
+            scans.extend((d, "body") for d in body_dirs)
+            scans.extend((d, "face") for d in identity_dirs)
+
+            for directory, sample_type in scans:
+                if not directory.exists() or not directory.is_dir():
+                    continue
+                for file_path in directory.rglob("*"):
+                    if not file_path.is_file():
+                        continue
+                    if file_path.suffix.lower() not in IMAGE_EXTENSIONS:
+                        continue
+                    identity_id = _guess_identity_id_from_path(file_path)
+                    if identity_id is None or identity_id not in identity_ids:
+                        report["orphans"] += 1
+                        continue
+                    rel_path = file_path.resolve().relative_to(media_root).as_posix()
+                    inserted = _upsert_identity_sample(conn, identity_id, rel_path, sample_type)
+                    if inserted:
+                        report["added"] += 1
+
+                    if sample_type == "face" and "face_sample_path" in columns:
+                        updated = conn.execute(
+                            "UPDATE identities SET face_sample_path=COALESCE(face_sample_path, ?) WHERE id=?",
+                            (rel_path, identity_id),
+                        ).rowcount
+                        if updated:
+                            report["linked"] += 1
+                    elif sample_type == "body" and "body_sample_path" in columns:
+                        updated = conn.execute(
+                            "UPDATE identities SET body_sample_path=COALESCE(body_sample_path, ?) WHERE id=?",
+                            (rel_path, identity_id),
+                        ).rowcount
+                        if updated:
+                            report["linked"] += 1
+            conn.commit()
+    except Exception:
+        LOGGER.exception("Identity reindex failed")
+        raise
+    return report
 
 
 @router.get("")
@@ -409,3 +559,17 @@ def mute_identity(identity_id: int, request: Request) -> Dict[str, Any]:
 def merge_identity(identity_id: int, body: MergeIdentityBody, request: Request) -> Dict[str, Any]:
     _ensure_authorized(request)
     return {"ok": True, "source_id": identity_id, "merged_into": str(body.target_id)}
+
+
+@router.post("/reindex")
+def reindex_identities(request: Request) -> Dict[str, int]:
+    _ensure_authorized(request)
+    runtime = _runtime(request)
+    report = run_reindex(runtime)
+    LOGGER.info(
+        "Manual reindex complete | added=%s linked=%s orphans=%s",
+        report["added"],
+        report["linked"],
+        report["orphans"],
+    )
+    return report

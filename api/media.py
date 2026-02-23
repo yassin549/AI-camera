@@ -6,12 +6,11 @@ import asyncio
 import logging
 from typing import Any, AsyncGenerator
 
-import cv2
 from fastapi import APIRouter, FastAPI, HTTPException, Request, status
 from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
-from config import MJPEG_FPS, MJPEG_JPEG_QUALITY, is_api_key_valid
+from config import MJPEG_FPS, MJPEG_MAX_CLIENTS, is_api_key_valid
 
 LOGGER = logging.getLogger("aicam.api.media")
 
@@ -34,54 +33,42 @@ def _runtime(request: Request) -> Any:
     return runtime
 
 
-def _encode_jpeg(frame) -> bytes:
-    ok, encoded = cv2.imencode(
-        ".jpg",
-        frame,
-        [int(cv2.IMWRITE_JPEG_QUALITY), int(MJPEG_JPEG_QUALITY)],
-    )
-    if not ok:
-        raise RuntimeError("Failed to encode MJPEG frame")
-    return encoded.tobytes()
-
-
 async def _mjpeg_generator(runtime: Any, client_host: str) -> AsyncGenerator[bytes, None]:
     interval = max(1.0 / MJPEG_FPS, 0.01)
-    last_frame_id = -1
-    last_jpeg: bytes | None = None
+    runtime.register_mjpeg_client()
     LOGGER.info("MJPEG stream opened from %s", client_host)
     try:
         while True:
-            packet = runtime.frame_store.get_latest()
-            if packet is not None and packet.frame_id != last_frame_id:
-                try:
-                    last_jpeg = _encode_jpeg(packet.frame)
-                    last_frame_id = int(packet.frame_id)
-                except Exception:
-                    LOGGER.debug("MJPEG encode failed", exc_info=True)
-
-            if last_jpeg is not None:
+            try:
+                frame_bytes = runtime.get_latest_jpeg()
                 payload = (
                     b"--frame\r\n"
                     b"Content-Type: image/jpeg\r\n"
-                    + f"Content-Length: {len(last_jpeg)}\r\n\r\n".encode("ascii")
-                    + last_jpeg
+                    + f"Content-Length: {len(frame_bytes)}\r\n\r\n".encode("ascii")
+                    + frame_bytes
                     + b"\r\n"
                 )
                 yield payload
+            except Exception:
+                LOGGER.debug("MJPEG stream iteration failed", exc_info=True)
 
             await asyncio.sleep(interval)
     except asyncio.CancelledError:
         LOGGER.info("MJPEG stream cancelled for %s", client_host)
         raise
+    except Exception:
+        LOGGER.exception("MJPEG stream error for %s", client_host)
     finally:
+        runtime.unregister_mjpeg_client()
         LOGGER.info("MJPEG stream closed for %s", client_host)
 
 
-@router.get("/stream.mjpeg")
-async def stream_mjpeg(request: Request) -> StreamingResponse:
+async def _stream_mjpeg_impl(request: Request) -> StreamingResponse:
     _ensure_authorized(request)
     runtime = _runtime(request)
+    mjpeg_clients, _ = runtime.get_client_counts()
+    if mjpeg_clients >= MJPEG_MAX_CLIENTS:
+        raise HTTPException(status_code=503, detail="Too many MJPEG clients")
     host = request.client.host if request.client else "unknown"
     return StreamingResponse(
         _mjpeg_generator(runtime, host),
@@ -92,3 +79,13 @@ async def stream_mjpeg(request: Request) -> StreamingResponse:
             "Connection": "keep-alive",
         },
     )
+
+
+@router.get("/api/media/mjpeg")
+async def stream_mjpeg_api(request: Request) -> StreamingResponse:
+    return await _stream_mjpeg_impl(request)
+
+
+@router.get("/stream.mjpeg")
+async def stream_mjpeg_legacy(request: Request) -> StreamingResponse:
+    return await _stream_mjpeg_impl(request)

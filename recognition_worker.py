@@ -181,13 +181,19 @@ class RecognitionWorker:
         y2 = max(y1 + 1, min(h, y2))
         sample = frame_bgr[y1:y2, x1:x2]
 
-        sample_path = str(Path(self.faces_dir) / f"face_{int(time.time() * 1000)}_t{track_id}.jpg")
-        if sample.size > 0:
-            cv2.imwrite(sample_path, sample)
-        else:
-            sample_path = None
+        # Create identity first so we can use the ID in the filename.
+        new_id = db.add_identity(face_emb, None, None, None, now_ts)
 
-        new_id = db.add_identity(face_emb, None, sample_path, None, now_ts)
+        # Save the face sample with identity ID in the filename so that
+        # _discover_face_thumb() can find it via the <id>_*.jpg glob pattern.
+        sample_path: Optional[str] = None
+        if sample.size > 0:
+            ts_str = time.strftime("%Y-%m-%d_%H-%M-%S")
+            sample_path = str(Path(self.faces_dir) / f"{int(new_id)}_{ts_str}.jpg")
+            cv2.imwrite(sample_path, sample)
+            # Update the DB row with the sample path.
+            db.update_face_sample_path(int(new_id), sample_path)
+
         self.track_store.assign_identity(
             track_id=track_id,
             identity_id=int(new_id),

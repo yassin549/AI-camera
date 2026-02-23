@@ -425,6 +425,18 @@ class IdentityStore:
                 wait=False,
             )
 
+    def update_face_sample_path(self, ident_id: int, path: str) -> None:
+        """Update face_sample_path for an existing identity."""
+        with self.lock:
+            if ident_id in self._row_cache:
+                self._row_cache[ident_id]["face_sample_path"] = path
+        if not self.ephemeral:
+            self._enqueue(
+                "UPDATE identities SET face_sample_path=? WHERE id=?",
+                (path, ident_id),
+                wait=False,
+            )
+
     def find_best_face(self, face_emb: np.ndarray) -> Tuple[Optional[int], float]:
         query = self._coerce_dim(face_emb, 128)
         with self.lock:
@@ -507,6 +519,10 @@ def load_all_embeddings() -> Dict[str, object]:
 
 def update_body_ema(ident_id: int, body_emb: np.ndarray, alpha: float = 0.2) -> None:
     _store().update_body_ema(ident_id=ident_id, body_emb=body_emb, alpha=alpha)
+
+
+def update_face_sample_path(ident_id: int, path: str) -> None:
+    _store().update_face_sample_path(ident_id=ident_id, path=path)
 
 
 def list_identities() -> List[Dict[str, object]]:

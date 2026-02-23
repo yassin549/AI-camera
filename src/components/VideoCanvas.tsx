@@ -138,6 +138,7 @@ export function VideoCanvas({
   const disableWebRtc = (import.meta.env.VITE_DISABLE_WEBRTC as string | undefined) === "true";
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const mjpegImgRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const projectedTracksRef = useRef<ProjectedTrack[]>([]);
   const thumbCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
@@ -147,6 +148,7 @@ export function VideoCanvas({
   const resizeKeyRef = useRef(0);
   const rafRef = useRef<number | null>(null);
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const transportModeRef = useRef<TransportMode>("connecting");
 
   const [transportMode, setTransportMode] = useState<TransportMode>("connecting");
   const [transportError, setTransportError] = useState<string | null>(null);
@@ -180,32 +182,42 @@ export function VideoCanvas({
   };
 
   const activateFallback = () => {
-    const video = videoRef.current;
-    if (!video) {
-      return;
-    }
     closePeerConnection();
-    video.srcObject = null;
-    video.src = resolvedFallbackSrc;
-    video.play().catch(() => {
-      // Browser autoplay policy can block without user interaction.
-    });
+    const video = videoRef.current;
+    if (video) {
+      video.srcObject = null;
+      video.removeAttribute("src");
+      video.style.display = "none";
+    }
+    const img = mjpegImgRef.current;
+    if (img) {
+      img.src = resolvedFallbackSrc;
+      img.style.display = "block";
+    }
+    transportModeRef.current = "mjpeg";
     setTransportMode("mjpeg");
   };
 
   useEffect(() => {
     let cancelled = false;
     const video = videoRef.current;
-    if (!video || !active) {
+    const img = mjpegImgRef.current;
+    if (!active) {
       closePeerConnection();
-      if (!active) {
-        video?.pause();
-        if (video) {
-          video.srcObject = null;
-          video.removeAttribute("src");
-        }
-        setTransportMode("connecting");
+      if (video) {
+        video.pause();
+        video.srcObject = null;
+        video.removeAttribute("src");
       }
+      if (img) {
+        img.removeAttribute("src");
+        img.style.display = "none";
+      }
+      transportModeRef.current = "connecting";
+      setTransportMode("connecting");
+      return;
+    }
+    if (!video) {
       return;
     }
 
@@ -226,6 +238,11 @@ export function VideoCanvas({
         pc.addTransceiver("video", { direction: "recvonly" });
         pc.ontrack = (event) => {
           if (event.streams[0]) {
+            video.style.display = "block";
+            if (img) {
+              img.removeAttribute("src");
+              img.style.display = "none";
+            }
             video.srcObject = event.streams[0];
             video.play().catch(() => {
               // Browser autoplay policy can block without user interaction.
@@ -255,6 +272,7 @@ export function VideoCanvas({
 
         await pc.setRemoteDescription(answer);
         setTransportError(null);
+        transportModeRef.current = "webrtc";
         setTransportMode("webrtc");
       } catch (err) {
         if (cancelled) {
@@ -297,20 +315,35 @@ export function VideoCanvas({
   }, []);
 
   useEffect(() => {
+    let mjpegFrameKey = 0;
     const draw = () => {
       const canvas = canvasRef.current;
       const video = videoRef.current;
+      const img = mjpegImgRef.current;
       const container = containerRef.current;
-      if (!canvas || !video || !container) {
+      if (!canvas || !container) {
         rafRef.current = window.requestAnimationFrame(draw);
         return;
+      }
+
+      const isMjpeg = transportModeRef.current === "mjpeg";
+
+      // Determine source dimensions from the active media element
+      let nativeW = 0;
+      let nativeH = 0;
+      if (isMjpeg && img) {
+        nativeW = img.naturalWidth;
+        nativeH = img.naturalHeight;
+      } else if (video) {
+        nativeW = video.videoWidth;
+        nativeH = video.videoHeight;
       }
 
       const rect = container.getBoundingClientRect();
       const cssWidth = Math.max(1, Math.round(rect.width));
       const cssHeight = Math.max(1, Math.round(rect.height));
-      const sourceWidth = Math.max(1, Math.round(video.videoWidth || cssWidth));
-      const sourceHeight = Math.max(1, Math.round(video.videoHeight || cssHeight));
+      const sourceWidth = Math.max(1, Math.round(nativeW || cssWidth));
+      const sourceHeight = Math.max(1, Math.round(nativeH || cssHeight));
       const dpr = window.devicePixelRatio || 1;
 
       const bufferWidth = pixelPerfect ? Math.round(sourceWidth * dpr) : Math.round(cssWidth * dpr);
@@ -343,13 +376,15 @@ export function VideoCanvas({
         sourceHeight
       };
 
+      // For MJPEG mode, always redraw because the <img> updates in-place
       const latest = latestMetadataRef.current;
-      const sizeKey = `${cssWidth}x${cssHeight}:${sourceWidth}x${sourceHeight}:${
-        resizeKeyRef.current
-      }:${pixelPerfect ? "pp" : "fit"}`;
+      const currentMjpegKey = isMjpeg ? ++mjpegFrameKey : 0;
+      const sizeKey = `${cssWidth}x${cssHeight}:${sourceWidth}x${sourceHeight}:${resizeKeyRef.current
+        }:${pixelPerfect ? "pp" : "fit"}:${isMjpeg ? currentMjpegKey : ""}`;
       const latestFrameId = latest?.frame_id ?? -1;
       const cache = drawCacheRef.current;
       const shouldDraw =
+        isMjpeg ||
         cache.frameId !== latestFrameId ||
         cache.sizeKey !== sizeKey ||
         cache.focusedTrackId !== focusedTrackId;
@@ -364,6 +399,16 @@ export function VideoCanvas({
 
       ctx.clearRect(0, 0, cssWidth, cssHeight);
       projectedTracksRef.current = [];
+
+      // In MJPEG mode, draw the <img> onto the canvas as the video background
+      if (isMjpeg && img && img.complete && img.naturalWidth > 0) {
+        const fitScale = Math.min(cssWidth / img.naturalWidth, cssHeight / img.naturalHeight);
+        const drawW = img.naturalWidth * fitScale;
+        const drawH = img.naturalHeight * fitScale;
+        const drawX = (cssWidth - drawW) / 2;
+        const drawY = (cssHeight - drawH) / 2;
+        ctx.drawImage(img, drawX, drawY, drawW, drawH);
+      }
 
       if (!latest || sourceWidth < 2 || sourceHeight < 2) {
         rafRef.current = window.requestAnimationFrame(draw);
@@ -475,7 +520,14 @@ export function VideoCanvas({
         muted
         playsInline
         className="h-full w-full object-contain"
+        style={{ display: transportMode === "mjpeg" ? "none" : "block" }}
         aria-label="Live camera stream"
+      />
+      {/* Hidden MJPEG <img> — browsers can render multipart/x-mixed-replace on <img> but not <video> */}
+      <img
+        ref={mjpegImgRef}
+        alt="MJPEG live stream"
+        style={{ display: "none", position: "absolute", width: 0, height: 0, pointerEvents: "none" }}
       />
       <canvas
         ref={canvasRef}

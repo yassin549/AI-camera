@@ -14,7 +14,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from config import WS_HEARTBEAT_SEC, is_api_key_valid
+from config import WS_HEARTBEAT_SEC, WS_MAX_CLIENTS, is_api_key_valid
 
 LOGGER = logging.getLogger("aicam.api.realtime")
 
@@ -104,14 +104,19 @@ def _normalize_offer(raw_body: bytes, content_type: str) -> WebRtcOfferBody:
     return WebRtcOfferBody(**payload)
 
 
-@router.websocket("/ws/metadata")
-async def ws_metadata(websocket: WebSocket) -> None:
+async def _ws_metadata_impl(websocket: WebSocket) -> None:
     if not is_api_key_valid(websocket.headers.get("x-api-key")):
         await websocket.close(code=4401, reason="Invalid API key")
         return
 
-    await websocket.accept()
     runtime = _runtime_from_websocket(websocket)
+    _, ws_clients = runtime.get_client_counts()
+    if ws_clients >= WS_MAX_CLIENTS:
+        await websocket.close(code=4403, reason="Too many WS clients")
+        return
+
+    await websocket.accept()
+    runtime.register_ws_client()
     client = websocket.client.host if websocket.client else "unknown"
     LOGGER.info("WS metadata connected from %s", client)
     last_version = 0
@@ -140,6 +145,8 @@ async def ws_metadata(websocket: WebSocket) -> None:
                 message = await asyncio.wait_for(websocket.receive_text(), timeout=0.03)
                 if message.strip().lower() == "ping":
                     await websocket.send_json({"type": "pong", "server_time": _utc_now_iso()})
+                elif message.strip().lower() == "close":
+                    break
             except asyncio.TimeoutError:
                 pass
     except WebSocketDisconnect:
@@ -147,10 +154,21 @@ async def ws_metadata(websocket: WebSocket) -> None:
     except Exception:
         LOGGER.exception("WS metadata error for %s", client)
     finally:
+        runtime.unregister_ws_client()
         try:
             await websocket.close()
         except Exception:
             pass
+
+
+@router.websocket("/api/realtime/ws")
+async def ws_metadata_api(websocket: WebSocket) -> None:
+    await _ws_metadata_impl(websocket)
+
+
+@router.websocket("/ws/metadata")
+async def ws_metadata_legacy(websocket: WebSocket) -> None:
+    await _ws_metadata_impl(websocket)
 
 
 @router.post("/webrtc/offer")
@@ -206,3 +224,8 @@ async def webrtc_offer(request: Request) -> JSONResponse:
         except Exception:
             pass
         raise HTTPException(status_code=500, detail=f"WebRTC negotiation failed: {exc}") from exc
+
+
+@router.post("/api/media/webrtc/offer")
+async def webrtc_offer_api(request: Request) -> JSONResponse:
+    return await webrtc_offer(request)

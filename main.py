@@ -55,7 +55,7 @@ def load_config(path: str) -> Dict[str, object]:
     cfg.setdefault("cache_seconds", 30)
     cfg.setdefault("max_tracks", 20)
     cfg.setdefault("http_port", 8080)
-    cfg.setdefault("http_host", "127.0.0.1")
+    cfg.setdefault("http_host", "0.0.0.0")
     cfg.setdefault("display_window", True)
     cfg.setdefault("debug", False)
     cfg.setdefault("debug_csv", "./debug/perf.csv")

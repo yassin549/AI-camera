@@ -15,6 +15,7 @@ STATIC_PATH = Path(os.getenv("AICAM_STATIC_PATH", str(PROJECT_ROOT))).resolve()
 # Keep MJPEG conservative by default to reduce API CPU overhead.
 MJPEG_FPS = max(1.0, float(os.getenv("AICAM_MJPEG_FPS", "12")))
 MJPEG_JPEG_QUALITY = int(os.getenv("AICAM_MJPEG_QUALITY", "80"))
+MJPEG_MAX_CLIENTS = max(1, int(os.getenv("AICAM_MJPEG_MAX_CLIENTS", "8")))
 
 _cors_from_env = os.getenv("CORS_ORIGINS", "").strip()
 if _cors_from_env:
@@ -31,6 +32,7 @@ DELETE_SAMPLE_FILES = os.getenv("AICAM_DELETE_SAMPLE_FILES", "0").strip().lower(
 
 HEALTH_FRAME_STALE_SEC = max(1.0, float(os.getenv("AICAM_HEALTH_STALE_SEC", "5")))
 WS_HEARTBEAT_SEC = max(3.0, float(os.getenv("AICAM_WS_HEARTBEAT_SEC", "10")))
+WS_MAX_CLIENTS = max(1, int(os.getenv("AICAM_WS_MAX_CLIENTS", "64")))
 
 
 def is_api_key_valid(candidate: Optional[str]) -> bool:
