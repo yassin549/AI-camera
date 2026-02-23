@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+pytest-cache-files-*/
+identities.db
+faces/
+*.log
+.env
+node_modules/
+dist/
+.vite/
+coverage/

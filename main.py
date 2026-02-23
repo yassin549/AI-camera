@@ -1,484 +1,405 @@
+"""AIcam multithreaded orchestrator for smooth CPU-only live tracking and ID."""
+
 from __future__ import annotations
 
 import argparse
+import csv
 import logging
-import os
 import threading
 import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple
 
 import cv2
 import yaml
-from flask import Flask, jsonify
 
 import db
-from detector import FaceDetector
-from embedder import FaceEmbedder
-from utils import ensure_rtsp_tcp, iou, sanitize_ts_for_filename, save_thumbnail, timestamp_now_iso
+from api_server import ApiRuntimeState, run_api_server
+from capture import CaptureWorker
+from detector_yolo import Detection, YOLOv8ONNXDetector
+from recognition_worker import RecognitionWorker
+from tracker_adapter import Track, TrackerAdapter
+from utils import (
+    CounterFPS,
+    FrameTimingStore,
+    LatestFrameStore,
+    SharedTrackStore,
+    StageStats,
+)
+
+LOGGER = logging.getLogger("aicam")
 
 
-@dataclass
-class AppConfig:
-    rtsp_url: str
-    cosine_threshold: float
-    skip_n: int
-    imgsz: Tuple[int, int]
-    db_path: str
-    faces_dir: str
-    http_port: int
-    cache_seconds: int
-
-
-class RecentFaceCache:
-    """Tracks recently seen boxes to avoid repeated embedding+DB work."""
-
-    def __init__(self, ttl_seconds: int, iou_threshold: float = 0.45) -> None:
-        self.ttl_seconds = ttl_seconds
-        self.iou_threshold = iou_threshold
-        self.entries: List[Dict[str, object]] = []
-
-    def _purge(self, now_ts: float) -> None:
-        self.entries = [
-            e for e in self.entries if (now_ts - float(e["last_seen_ts"])) <= self.ttl_seconds
-        ]
-
-    def lookup(self, box: Tuple[int, int, int, int], now_ts: float) -> Optional[Dict[str, object]]:
-        self._purge(now_ts)
-        best_entry = None
-        best_iou = 0.0
-        for entry in self.entries:
-            overlap = iou(box, entry["box"])  # type: ignore[arg-type]
-            if overlap >= self.iou_threshold and overlap > best_iou:
-                best_entry = entry
-                best_iou = overlap
-
-        if best_entry is not None:
-            best_entry["box"] = box
-            best_entry["last_seen_ts"] = now_ts
-        return best_entry
-
-    def upsert(
-        self, box: Tuple[int, int, int, int], identity_id: int, score: float, now_ts: float
-    ) -> None:
-        for entry in self.entries:
-            overlap = iou(box, entry["box"])  # type: ignore[arg-type]
-            if overlap >= self.iou_threshold:
-                entry["box"] = box
-                entry["id"] = identity_id
-                entry["score"] = score
-                entry["last_seen_ts"] = now_ts
-                return
-
-        self.entries.append(
-            {
-                "box": box,
-                "id": identity_id,
-                "score": score,
-                "last_seen_ts": now_ts,
-            }
-        )
-
-
-class DashboardState:
-    """Thread-safe recognized identity view for HTTP endpoint."""
-
-    def __init__(self) -> None:
-        self._lock = threading.Lock()
-        self._records: Dict[int, Dict[str, object]] = {}
-
-    def record(
-        self,
-        identity_id: int,
-        first_seen: Optional[str],
-        last_seen: str,
-        sample_path: Optional[str],
-        score: float,
-    ) -> None:
-        with self._lock:
-            row = self._records.get(identity_id)
-            if row is None:
-                self._records[identity_id] = {
-                    "id": identity_id,
-                    "first_seen": first_seen,
-                    "last_seen": last_seen,
-                    "sample_path": sample_path,
-                    "last_score": float(score),
-                    "count": 1,
-                }
-                return
-
-            row["last_seen"] = last_seen
-            row["last_score"] = float(score)
-            row["count"] = int(row["count"]) + 1
-            if not row.get("first_seen") and first_seen:
-                row["first_seen"] = first_seen
-            if sample_path and not row.get("sample_path"):
-                row["sample_path"] = sample_path
-
-    def snapshot(self, active_within_seconds: int) -> List[Dict[str, object]]:
-        cutoff = datetime.now(timezone.utc).timestamp() - active_within_seconds
-        with self._lock:
-            items = []
-            for row in self._records.values():
-                try:
-                    ts = datetime.fromisoformat(str(row["last_seen"])).timestamp()
-                except ValueError:
-                    continue
-                if ts >= cutoff:
-                    items.append(dict(row))
-            items.sort(key=lambda x: int(x["id"]))
-            return items
-
-
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="RTSP face recognition (CPU-only).")
-    parser.add_argument("--config", default="config.yaml", help="Path to config YAML.")
-    parser.add_argument(
-        "--demo",
-        nargs="?",
-        const="demo.mp4",
-        default=None,
-        help="Demo mode. Optional video file path; falls back to webcam index 0.",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        help="Enable verbose per-frame timing logs.",
-    )
-    return parser.parse_args()
-
-
-def setup_logging(verbose: bool) -> None:
-    level = logging.DEBUG if verbose else logging.INFO
+def setup_logging(debug: bool) -> None:
+    level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
         level=level,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
 
 
-def load_config(config_path: str) -> AppConfig:
-    defaults = {
-        "RTSP_URL": "",
-        "cosine_threshold": 0.60,
-        "skip_n": 2,
-        "imgsz": [640, 360],
-        "db_path": "./identities.db",
-        "faces_dir": "./faces",
-        "http_port": 8080,
-        "cache_seconds": 30,
-    }
-    cfg_data: Dict[str, object] = {}
-    if os.path.exists(config_path):
-        with open(config_path, "r", encoding="utf-8") as f:
-            loaded = yaml.safe_load(f) or {}
-            if isinstance(loaded, dict):
-                cfg_data = loaded
-    merged = {**defaults, **cfg_data}
-    imgsz = merged.get("imgsz", [640, 360])
-    if not isinstance(imgsz, (list, tuple)) or len(imgsz) != 2:
-        imgsz = [640, 360]
+def load_config(path: str) -> Dict[str, object]:
+    with open(path, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
 
-    return AppConfig(
-        rtsp_url=str(merged.get("RTSP_URL", "")),
-        cosine_threshold=float(merged.get("cosine_threshold", 0.60)),
-        skip_n=max(0, int(merged.get("skip_n", 2))),
-        imgsz=(int(imgsz[0]), int(imgsz[1])),
-        db_path=str(merged.get("db_path", "./identities.db")),
-        faces_dir=str(merged.get("faces_dir", "./faces")),
-        http_port=int(merged.get("http_port", 8080)),
-        cache_seconds=max(1, int(merged.get("cache_seconds", 30))),
-    )
+    if "RTSP_URL" in cfg and "rtsp_url" not in cfg:
+        cfg["rtsp_url"] = cfg["RTSP_URL"]
+
+    # Runtime defaults.
+    cfg.setdefault("imgsz", [640, 360])
+    cfg.setdefault("detection_interval", 3)
+    cfg.setdefault("face_interval_frames", 10)
+    cfg.setdefault("body_interval_frames", 10)
+    cfg.setdefault("face_threshold", 0.60)
+    cfg.setdefault("body_threshold", 0.40)
+    cfg.setdefault("cache_seconds", 30)
+    cfg.setdefault("max_tracks", 20)
+    cfg.setdefault("http_port", 8080)
+    cfg.setdefault("http_host", "127.0.0.1")
+    cfg.setdefault("display_window", True)
+    cfg.setdefault("debug", False)
+    cfg.setdefault("debug_csv", "./debug/perf.csv")
+    cfg.setdefault("disable_body_embedding", True)
+
+    # Model defaults.
+    cfg.setdefault("yolo_onnx_path", "./models/yolov8n_person.onnx")
+    cfg.setdefault("person_conf_threshold", 0.50)
+    cfg.setdefault("person_iou_threshold", 0.50)
+    cfg.setdefault("tracker_match_threshold", 0.80)
+
+    return cfg
 
 
-def choose_video_source(
-    cfg: AppConfig, demo_arg: Optional[str]
-) -> Tuple[Optional[Union[int, str]], bool]:
-    if demo_arg is not None:
-        candidate_paths = []
-        if demo_arg:
-            candidate_paths.append(Path(demo_arg))
-        candidate_paths.append(Path("demo.mp4"))
-        for candidate in candidate_paths:
-            if candidate.exists() and candidate.is_file():
-                return str(candidate), False
-        return 0, False
+def _render_overlay(frame, tracks: List[object]) -> None:
+    for st in tracks:
+        x1, y1, x2, y2 = [int(v) for v in st.bbox]
+        ident = st.identity_id
+        modality = st.modality
+        score = st.identity_score
 
-    env_rtsp = os.getenv("RTSP_URL", "").strip()
-    rtsp_url = env_rtsp or cfg.rtsp_url
-    if not rtsp_url:
-        return None, False
-    return ensure_rtsp_tcp(rtsp_url), True
-
-
-def open_capture(source: Union[int, str], is_rtsp: bool) -> cv2.VideoCapture:
-    if is_rtsp:
-        cap = cv2.VideoCapture(source, cv2.CAP_FFMPEG)
-    else:
-        cap = cv2.VideoCapture(source)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
-    return cap
-
-
-def draw_annotations(
-    frame, annotations: List[Tuple[Tuple[int, int, int, int], str, Tuple[int, int, int]]]
-) -> None:
-    for (x1, y1, x2, y2), label, color in annotations:
+        color = (30, 220, 30) if ident is not None else (0, 190, 255)
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        label = f"T{st.track_id} I{ident if ident is not None else '-'} {modality}:{score:.2f}"
         cv2.putText(
             frame,
             label,
-            (x1, max(20, y1 - 8)),
+            (x1, max(20, y1 - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.5,
             color,
             2,
             cv2.LINE_AA,
         )
 
 
-def scale_annotations(
-    annotations: List[Tuple[Tuple[int, int, int, int], str, Tuple[int, int, int]]],
-    src_size: Tuple[int, int],
-    dst_size: Tuple[int, int],
-) -> List[Tuple[Tuple[int, int, int, int], str, Tuple[int, int, int]]]:
-    """Scale annotation boxes from source-space to destination-space."""
-    src_w, src_h = src_size
-    dst_w, dst_h = dst_size
-    if src_w <= 0 or src_h <= 0:
-        return annotations
+def _log_stage_window(
+    stage_stats: StageStats,
+    fps_detection: CounterFPS,
+    fps_tracking: CounterFPS,
+    fps_recognition: CounterFPS,
+    fps_render: CounterFPS,
+    window_sec: float,
+) -> None:
+    d_cnt, d_avg, d_p95 = stage_stats.summary("detection_ms")
+    t_cnt, t_avg, t_p95 = stage_stats.summary("tracking_ms")
+    r_cnt, r_avg, r_p95 = stage_stats.summary("recognition_ms")
+    v_cnt, v_avg, v_p95 = stage_stats.summary("render_ms")
 
-    sx = dst_w / float(src_w)
-    sy = dst_h / float(src_h)
-    scaled: List[Tuple[Tuple[int, int, int, int], str, Tuple[int, int, int]]] = []
-    for (x1, y1, x2, y2), label, color in annotations:
-        scaled.append(
-            (
-                (
-                    int(round(x1 * sx)),
-                    int(round(y1 * sy)),
-                    int(round(x2 * sx)),
-                    int(round(y2 * sy)),
-                ),
-                label,
-                color,
-            )
+    det_fps = fps_detection.pop() / max(window_sec, 1e-6)
+    trk_fps = fps_tracking.pop() / max(window_sec, 1e-6)
+    rec_fps = fps_recognition.pop() / max(window_sec, 1e-6)
+    rnd_fps = fps_render.pop() / max(window_sec, 1e-6)
+
+    LOGGER.info(
+        "FPS(det/track/rec/render)=%.1f/%.1f/%.1f/%.1f | "
+        "ms avg,p95 det=%.1f,%.1f track=%.1f,%.1f rec=%.1f,%.1f render=%.1f,%.1f | counts d=%d t=%d r=%d v=%d",
+        det_fps,
+        trk_fps,
+        rec_fps,
+        rnd_fps,
+        d_avg,
+        d_p95,
+        t_avg,
+        t_p95,
+        r_avg,
+        r_p95,
+        v_avg,
+        v_p95,
+        d_cnt,
+        t_cnt,
+        r_cnt,
+        v_cnt,
+    )
+
+
+def run_pipeline(
+    cfg: Dict[str, object],
+    *,
+    start_api: bool,
+    benchmark: bool,
+    benchmark_seconds: int,
+    display_window: bool,
+) -> None:
+    db.configure(str(cfg.get("db_path", "./identities.db")), ephemeral=bool(cfg.get("ephemeral_mode", False)))
+    db.init_db()
+    db.load_all_embeddings()
+
+    frame_store = LatestFrameStore()
+    track_store = SharedTrackStore()
+    timing_store = FrameTimingStore()
+    stage_stats = StageStats(window=4096)
+
+    fps_detection = CounterFPS()
+    fps_tracking = CounterFPS()
+    fps_recognition = CounterFPS()
+    fps_render = CounterFPS()
+
+    stop_event = threading.Event()
+
+    imgsz = tuple(cfg.get("imgsz", [640, 360]))
+
+    detector = YOLOv8ONNXDetector(
+        model_path=str(cfg["yolo_onnx_path"]),
+        imgsz=imgsz,
+        conf_threshold=float(cfg.get("person_conf_threshold", 0.50)),
+        iou_threshold=float(cfg.get("person_iou_threshold", 0.50)),
+        feature_output_name=cfg.get("yolo_feature_output_name"),
+        disable_body_embedding=bool(cfg.get("disable_body_embedding", True)),
+    )
+
+    tracker = TrackerAdapter(
+        track_thresh=float(cfg.get("person_conf_threshold", 0.50)),
+        match_thresh=float(cfg.get("tracker_match_threshold", 0.80)),
+        max_tracks=int(cfg.get("max_tracks", 20)),
+    )
+
+    capture = CaptureWorker(
+        source=str(cfg.get("rtsp_url", "")),
+        imgsz=imgsz,
+        frame_store=frame_store,
+        stop_event=stop_event,
+    )
+
+    detection_interval = max(1, int(cfg.get("detection_interval", 3)))
+    max_tracks = int(cfg.get("max_tracks", 20))
+
+    def detection_loop() -> None:
+        last_frame_id = -1
+        while not stop_event.is_set():
+            packet = frame_store.wait_for_new(last_frame_id, timeout=0.1)
+            if packet is None:
+                continue
+
+            frame_id = int(packet.frame_id)
+            frame = packet.frame
+            last_frame_id = frame_id
+
+            tracks: List[Track]
+            if frame_id % detection_interval == 0:
+                t0 = time.perf_counter()
+                dets = detector.detect(frame)
+                det_ms = (time.perf_counter() - t0) * 1000.0
+                timing_store.set(frame_id, "detection_ms", det_ms)
+                stage_stats.add("detection_ms", det_ms)
+                fps_detection.inc(1)
+
+                tr_in = [Track(track_id=-1, bbox=d.bbox, score=d.score, feature=d.feature) for d in dets]
+                t1 = time.perf_counter()
+                tracks = tracker.update(tr_in)
+                tr_ms = (time.perf_counter() - t1) * 1000.0
+            else:
+                timing_store.set(frame_id, "detection_ms", 0.0)
+                t1 = time.perf_counter()
+                tracks = tracker.predict()
+                tr_ms = (time.perf_counter() - t1) * 1000.0
+
+            timing_store.set(frame_id, "tracking_ms", tr_ms)
+            stage_stats.add("tracking_ms", tr_ms)
+            fps_tracking.inc(1)
+
+            track_store.update_from_tracker(tracks, frame_id=frame_id, max_tracks=max_tracks)
+
+    api_state = ApiRuntimeState(
+        frame_store=frame_store,
+        db_path=str(cfg.get("db_path", "./identities.db")),
+        media_root=str(cfg.get("media_root", ".")),
+    )
+    recognition = RecognitionWorker(
+        frame_store=frame_store,
+        track_store=track_store,
+        cfg=cfg,
+        timing_store=timing_store,
+        stage_stats=stage_stats,
+        fps_counter=fps_recognition,
+        stop_event=stop_event,
+    )
+
+    capture.start()
+    detection_thread = threading.Thread(target=detection_loop, daemon=True, name="det-track-worker")
+    detection_thread.start()
+    recognition.start()
+
+    if start_api:
+        api_thread = threading.Thread(
+            target=run_api_server,
+            kwargs={
+                "runtime": api_state,
+                "host": str(cfg.get("http_host", "127.0.0.1")),
+                "port": int(cfg.get("http_port", 8080)),
+                "log_level": "info" if bool(cfg.get("debug", False)) else "warning",
+            },
+            daemon=True,
+            name="api-worker",
         )
-    return scaled
+        api_thread.start()
+        LOGGER.info("API started on http://%s:%s", cfg.get("http_host", "127.0.0.1"), cfg.get("http_port", 8080))
+
+    debug_writer = None
+    debug_file = None
+    if bool(cfg.get("debug", False)):
+        debug_path = Path(str(cfg.get("debug_csv", "./debug/perf.csv")))
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_file = debug_path.open("w", newline="", encoding="utf-8")
+        debug_writer = csv.writer(debug_file)
+        debug_writer.writerow(["frame_id", "detection_ms", "tracking_ms", "recognition_ms", "render_ms"])
+
+    started_at = time.time()
+    next_log_at = started_at + 10.0
+    last_rendered = -1
+
+    try:
+        while not stop_event.is_set():
+            packet = frame_store.wait_for_new(last_rendered, timeout=0.05)
+            now = time.time()
+
+            if benchmark and now - started_at >= float(benchmark_seconds):
+                break
+
+            if packet is None:
+                if now >= next_log_at:
+                    _log_stage_window(
+                        stage_stats,
+                        fps_detection,
+                        fps_tracking,
+                        fps_recognition,
+                        fps_render,
+                        window_sec=10.0,
+                    )
+                    next_log_at = now + 10.0
+                continue
+
+            frame_id = int(packet.frame_id)
+            frame = packet.frame.copy()
+            last_rendered = frame_id
+
+            t0 = time.perf_counter()
+            track_states = track_store.snapshot()
+            _render_overlay(frame, track_states)
+
+            api_state.publish_tracks(
+                track_store.to_api_payload(),
+                frame_id=frame_id,
+                frame_shape=frame.shape,
+            )
+
+            if display_window and not benchmark:
+                cv2.imshow("AIcam", frame)
+                key = cv2.waitKey(1) & 0xFF
+                if key in (27, ord("q")):
+                    break
+
+            render_ms = (time.perf_counter() - t0) * 1000.0
+            timing_store.set(frame_id, "render_ms", render_ms)
+            stage_stats.add("render_ms", render_ms)
+            fps_render.inc(1)
+
+            if debug_writer is not None:
+                row = timing_store.get(frame_id)
+                debug_writer.writerow(
+                    [
+                        frame_id,
+                        f"{row.get('detection_ms', 0.0):.3f}",
+                        f"{row.get('tracking_ms', 0.0):.3f}",
+                        f"{row.get('recognition_ms', 0.0):.3f}",
+                        f"{row.get('render_ms', 0.0):.3f}",
+                    ]
+                )
+
+            if now >= next_log_at:
+                _log_stage_window(
+                    stage_stats,
+                    fps_detection,
+                    fps_tracking,
+                    fps_recognition,
+                    fps_render,
+                    window_sec=10.0,
+                )
+                next_log_at = now + 10.0
+                timing_store.cleanup_older_than(frame_id - 600)
+    finally:
+        stop_event.set()
+        recognition.stop()
+        capture.stop()
+        detection_thread.join(timeout=2.0)
+        if debug_file is not None:
+            debug_file.close()
+        cv2.destroyAllWindows()
+
+    elapsed = max(1e-6, time.time() - started_at)
+    det_count, det_avg, det_p95 = stage_stats.summary("detection_ms")
+    trk_count, trk_avg, trk_p95 = stage_stats.summary("tracking_ms")
+    rec_count, rec_avg, rec_p95 = stage_stats.summary("recognition_ms")
+    rnd_count, rnd_avg, rnd_p95 = stage_stats.summary("render_ms")
+
+    if benchmark:
+        LOGGER.info(
+            "Benchmark %.1fs | det_fps=%.2f track_fps=%.2f rec_fps=%.2f render_fps=%.2f",
+            elapsed,
+            det_count / elapsed,
+            trk_count / elapsed,
+            rec_count / elapsed,
+            rnd_count / elapsed,
+        )
+        LOGGER.info(
+            "Stage ms avg,p95 | det=%.2f,%.2f track=%.2f,%.2f rec=%.2f,%.2f render=%.2f,%.2f",
+            det_avg,
+            det_p95,
+            trk_avg,
+            trk_p95,
+            rec_avg,
+            rec_p95,
+            rnd_avg,
+            rnd_p95,
+        )
 
 
-def start_http_server(
-    state: DashboardState, cache_seconds: int, port: int, logger: logging.Logger
-) -> threading.Thread:
-    app = Flask(__name__)
-
-    @app.get("/identities")
-    def identities():
-        rows = state.snapshot(active_within_seconds=cache_seconds)
-        return jsonify({"identities": rows, "count": len(rows)})
-
-    def _run():
-        logger.info("HTTP endpoint ready at http://127.0.0.1:%d/identities", port)
-        app.run(host="127.0.0.1", port=port, debug=False, use_reloader=False, threaded=True)
-
-    t = threading.Thread(target=_run, daemon=True)
-    t.start()
-    return t
-
-
-def get_identity_meta(
-    conn, meta_cache: Dict[int, Dict[str, object]], identity_id: int
-) -> Dict[str, object]:
-    if identity_id in meta_cache:
-        return meta_cache[identity_id]
-    meta = db.get_identity(conn, identity_id)
-    if meta is None:
-        meta = {"id": identity_id, "first_seen": None, "last_seen": None, "sample_path": None}
-    meta_cache[identity_id] = meta
-    return meta
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="AIcam threaded CPU pipeline")
+    parser.add_argument("--config", type=str, default="config.yaml")
+    parser.add_argument("--start-api", action="store_true", help="Start API server")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging + perf CSV")
+    parser.add_argument("--benchmark", action="store_true", help="Run benchmark mode")
+    parser.add_argument("--benchmark-seconds", type=int, default=60)
+    parser.add_argument("--no-display", action="store_true", help="Disable OpenCV window")
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    setup_logging(args.verbose)
-    logger = logging.getLogger("main")
-
     cfg = load_config(args.config)
-    source, is_rtsp = choose_video_source(cfg, args.demo)
-    if source is None:
-        logger.error("No RTSP source found. Set RTSP_URL or run with --demo.")
-        return
 
-    if is_rtsp:
-        logger.info("Using RTSP source: %s", source)
-    else:
-        logger.info("Using demo source: %s", source)
+    if args.debug:
+        cfg["debug"] = True
 
-    os.makedirs(cfg.faces_dir, exist_ok=True)
-    conn = db.get_connection(cfg.db_path)
-    db.init_db(conn)
-    identity_meta: Dict[int, Dict[str, object]] = {
-        int(row["id"]): row for row in db.list_identities(conn)
-    }
+    setup_logging(bool(cfg.get("debug", False)))
 
-    cap = open_capture(source, is_rtsp)
-    if not cap.isOpened():
-        logger.error("Failed to open capture source: %s", source)
-        conn.close()
-        return
-
-    detector = FaceDetector()
-    embedder = FaceEmbedder()
-    recent_faces = RecentFaceCache(ttl_seconds=cfg.cache_seconds)
-    dashboard_state = DashboardState()
-    start_http_server(dashboard_state, cfg.cache_seconds, cfg.http_port, logger)
-
-    frame_count = 0
-    reconnect_backoff = 0.5
-    last_db_update_ts: Dict[int, float] = {}
-    window_name = "Face Recognition"
-    window_initialized = False
-    last_window_size: Optional[Tuple[int, int]] = None
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if (not ret) or frame is None or frame.size == 0:
-                logger.warning("Frame read failed. Reconnecting in %.1fs...", reconnect_backoff)
-                cap.release()
-                time.sleep(reconnect_backoff)
-                cap = open_capture(source, is_rtsp)
-                reconnect_backoff = min(10.0, reconnect_backoff * 2.0)
-                continue
-
-            reconnect_backoff = 0.5
-            frame_count += 1
-            frame_h, frame_w = frame.shape[:2]
-            if not window_initialized:
-                cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-                cv2.resizeWindow(window_name, frame_w, frame_h)
-                window_initialized = True
-                last_window_size = (frame_w, frame_h)
-            elif last_window_size != (frame_w, frame_h):
-                cv2.resizeWindow(window_name, frame_w, frame_h)
-                last_window_size = (frame_w, frame_h)
-
-            resized = cv2.resize(frame, cfg.imgsz)
-
-            if frame_count % (cfg.skip_n + 1) != 0:
-                cv2.imshow(window_name, frame)
-                if cv2.waitKey(1) & 0xFF == ord("q"):
-                    break
-                continue
-
-            detect_t0 = time.perf_counter()
-            boxes = detector.detect_faces(resized)
-            detect_ms = (time.perf_counter() - detect_t0) * 1000.0
-            embed_total_ms = 0.0
-            annotations: List[Tuple[Tuple[int, int, int, int], str, Tuple[int, int, int]]] = []
-            now_mono = time.monotonic()
-
-            for box in boxes:
-                ts = timestamp_now_iso()
-                cache_entry = recent_faces.lookup(box, now_mono)
-                if cache_entry is not None:
-                    identity_id = int(cache_entry["id"])
-                    score = float(cache_entry["score"])
-                    if (now_mono - last_db_update_ts.get(identity_id, 0.0)) >= 3.0:
-                        db.update_last_seen(conn, identity_id, ts)
-                        last_db_update_ts[identity_id] = now_mono
-                        meta_row = get_identity_meta(conn, identity_meta, identity_id)
-                        meta_row["last_seen"] = ts
-                    meta_row = get_identity_meta(conn, identity_meta, identity_id)
-                    dashboard_state.record(
-                        identity_id=identity_id,
-                        first_seen=meta_row.get("first_seen"),  # type: ignore[arg-type]
-                        last_seen=ts,
-                        sample_path=meta_row.get("sample_path"),  # type: ignore[arg-type]
-                        score=score,
-                    )
-                    annotations.append((box, f"ID:{identity_id} (score:{score:.2f})", (0, 210, 0)))
-                    continue
-
-                embed_t0 = time.perf_counter()
-                embedding = embedder.compute_embedding(resized, box)
-                embed_total_ms += (time.perf_counter() - embed_t0) * 1000.0
-                if embedding is None:
-                    continue
-
-                best_id, similarity = db.find_best_match(conn, embedding)
-                if best_id is not None and similarity >= cfg.cosine_threshold:
-                    db.update_last_seen(conn, best_id, ts)
-                    last_db_update_ts[best_id] = now_mono
-                    recent_faces.upsert(box, best_id, similarity, now_mono)
-
-                    meta_row = get_identity_meta(conn, identity_meta, best_id)
-                    meta_row["last_seen"] = ts
-                    dashboard_state.record(
-                        identity_id=best_id,
-                        first_seen=meta_row.get("first_seen"),  # type: ignore[arg-type]
-                        last_seen=ts,
-                        sample_path=meta_row.get("sample_path"),  # type: ignore[arg-type]
-                        score=similarity,
-                    )
-                    annotations.append((box, f"ID:{best_id} (score:{similarity:.2f})", (0, 210, 0)))
-                    continue
-
-                crop, _ = embedder.extract_face_crop(resized, box)
-                new_id = db.add_identity(conn, embedding, sample_path=None, ts=ts)
-                thumb_path: Optional[str] = None
-                if crop is not None and crop.size > 0:
-                    thumb_name = f"{new_id}_{sanitize_ts_for_filename(ts)}.jpg"
-                    thumb_path = os.path.join(cfg.faces_dir, thumb_name)
-                    if save_thumbnail(thumb_path, crop):
-                        db.update_sample_path(conn, new_id, thumb_path)
-                    else:
-                        thumb_path = None
-
-                identity_meta[new_id] = {
-                    "id": new_id,
-                    "first_seen": ts,
-                    "last_seen": ts,
-                    "sample_path": thumb_path,
-                }
-                recent_faces.upsert(box, new_id, 1.0, now_mono)
-                dashboard_state.record(
-                    identity_id=new_id,
-                    first_seen=ts,
-                    last_seen=ts,
-                    sample_path=thumb_path,
-                    score=1.0,
-                )
-                annotations.append((box, f"New ID:{new_id}", (0, 165, 255)))
-
-            display_frame = frame.copy()
-            scaled_annotations = scale_annotations(
-                annotations=annotations,
-                src_size=cfg.imgsz,
-                dst_size=(frame_w, frame_h),
-            )
-            draw_annotations(display_frame, scaled_annotations)
-            if args.verbose:
-                logger.debug(
-                    "frame=%d faces=%d detect_ms=%.2f embed_ms=%.2f",
-                    frame_count,
-                    len(boxes),
-                    detect_ms,
-                    embed_total_ms,
-                )
-
-            cv2.imshow(window_name, display_frame)
-            if cv2.waitKey(1) & 0xFF == ord("q"):
-                break
-    except KeyboardInterrupt:
-        logger.info("Interrupted by user.")
-    finally:
-        detector.close()
-        cap.release()
-        conn.close()
-        cv2.destroyAllWindows()
+    run_pipeline(
+        cfg,
+        start_api=bool(args.start_api),
+        benchmark=bool(args.benchmark),
+        benchmark_seconds=int(args.benchmark_seconds),
+        display_window=not bool(args.no_display) and bool(cfg.get("display_window", True)),
+    )
 
 
 if __name__ == "__main__":

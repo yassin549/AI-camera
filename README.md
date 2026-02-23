@@ -1,116 +1,159 @@
-This system stores biometric data locally. Do not deploy it in contexts where legal restrictions apply without reviewing local laws and obtaining consent.
+﻿# AIcam Premium UI
 
-# Local RTSP Face Recognition (CPU-Optimized)
+Production-ready React + TypeScript frontend for AIcam with:
+- raw low-latency video transport via WebRTC (offer flow)
+- automatic MJPEG fallback (`/stream.mjpeg`)
+- client-side canvas overlays (boxes, labels, thumbs)
+- realtime metadata via WebSocket (`/ws/metadata`)
+- premium Live + Library UX with Framer Motion and Headless UI
 
-CPU-first face recognition pipeline for local RTSP cameras:
-- OpenCV + FFmpeg RTSP ingestion
-- MediaPipe face detection
-- `face_recognition` (dlib) 128-d embeddings
-- SQLite identity store with thumbnail snapshots
-- Flask endpoint for identity status (`/identities`)
+## Stack
+- React 18 + TypeScript (hooks)
+- Vite
+- Tailwind CSS
+- Framer Motion
+- Headless UI
+- Jest + React Testing Library
+- Node mock server (`/mock/server.js`)
 
-## Privacy and Safety
-- Data stays local on disk (`identities.db`, `./faces/`).
-- No cloud upload is implemented.
-- You are responsible for consent, notice, and legal compliance for biometric processing.
+## Project structure
+- `src/main.tsx` app bootstrap + router + global providers
+- `src/App.tsx` top bar + PremiumSwitch + route orchestration
+- `src/pages/LiveView.tsx` video surface + overlays + roster + quick actions
+- `src/pages/Library.tsx` identities grid, search, sort
+- `src/pages/IdentityDetail.tsx` full-screen identity detail + actions
+- `src/components/PremiumSwitch.tsx` accessible tab switch
+- `src/components/VideoCanvas.tsx` WebRTC + fallback + canvas + click/focus
+- `src/components/IdentityCard.tsx` compact library card
+- `src/hooks/useRealtime.ts` WebSocket lifecycle + reconnection/backoff
+- `src/config.ts` runtime endpoint + mock config
+- `src/api/client.ts` typed API wrappers + payload normalization
+- `src/styles/global.css` premium palette + glassmorphism tokens
+- `src/__tests__/IdentityCard.test.tsx` smoke test for card -> detail route
+- `mock/server.js` mock REST + WS metadata + MJPEG + WebRTC answer stub
 
-## Project Files
-- `main.py`: capture loop, reconnect logic, matching, cache, display, HTTP endpoint
-- `detector.py`: MediaPipe detector wrapper
-- `embedder.py`: face embedding extraction + embedding blob utilities
-- `db.py`: SQLite schema and identity CRUD/matching
-- `utils.py`: shared helpers (cosine, timestamps, thumbnail saving)
-- `config.yaml`: runtime config
-- `tests/test_db.py`: DB persistence and matching unit test
-- `run.sh` / `run.bat`: run examples
+## Prerequisites
+- Node.js 18+ (Node 20 recommended)
+- npm 9+
 
-## Install
+## Quick Start (Mock Backend)
+1. Install dependencies:
+```bash
+npm i
+```
+2. Start the mock backend:
+```bash
+npm run mock
+```
+3. In a second terminal, start the frontend in mock mode:
+```bash
+npm run dev:mock
+```
+4. Open `http://localhost:5173`.
 
-### Windows
+PowerShell example:
 ```powershell
-python -m venv venv && venv\Scripts\activate
-pip install -r requirements.txt
+npm i
+Start-Process powershell -ArgumentList "-NoExit","-Command","cd '$PWD'; npm run mock"
+npm run dev:mock
 ```
 
-### Linux/macOS
-```bash
-python -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-```
-
-## Windows dlib Tips
-- `face-recognition` depends on `dlib`, which can fail to build on Windows without Visual C++ build tools.
-- Prefer a prebuilt wheel when available, or install via Conda (`conda install -c conda-forge dlib face_recognition`).
-- If pip build fails, install Visual Studio Build Tools and CMake, then retry.
-- `face_recognition_models` expects `pkg_resources`; keep `setuptools` below 81 (already pinned in `requirements.txt`).
-
-## Configuration
-Edit `config.yaml` or set environment variable `RTSP_URL`.
-
-`config.yaml` defaults:
-- `RTSP_URL`: RTSP camera URL placeholder
-- `cosine_threshold`: default `0.60`
-- `skip_n`: default `2` (process every 3rd frame)
-- `imgsz`: `[640, 360]`
-- `db_path`: `./identities.db`
-- `faces_dir`: `./faces`
-- `http_port`: `8080`
-- `cache_seconds`: `30`
-
-## Run
-
-### RTSP mode
+## Run Against Real AIcam Backend
+1. Ensure your backend serves:
+   - `GET /api/identities`
+   - `GET /api/identities/:id`
+   - `POST /webrtc/offer`
+   - `ws://.../ws/metadata` (or `wss://.../ws/metadata`)
+2. Set environment overrides and run:
 ```powershell
-set RTSP_URL=rtsp://username:password@camera-ip:554/stream1
-python main.py
+$env:VITE_API_BASE='http://127.0.0.1:8080'
+$env:VITE_WS_METADATA_URL='ws://127.0.0.1:8080/ws/metadata'
+npm run dev
 ```
 
-or:
+## Force MJPEG Fallback (Disable WebRTC)
 ```bash
-./run.sh
+VITE_DISABLE_WEBRTC=true npm run dev
+```
+PowerShell:
+```powershell
+$env:VITE_DISABLE_WEBRTC='true'; npm run dev
 ```
 
-### Verbose logging
-```bash
-python main.py --verbose
-```
+## Scripts
+- `npm run dev` start Vite dev server (real backend defaults)
+- `npm run dev:mock` start Vite dev server with mock-target proxy config
+- `npm run build` type-check + production build
+- `npm run test` run Jest/RTL tests
+- `npm run mock` run local mock backend on `http://localhost:8787`
 
-### Demo mode
-Uses `demo.mp4` if present, else webcam index `0`.
-```bash
-python main.py --demo
-```
-Use a specific video:
-```bash
-python main.py --demo path/to/video.mp4
-```
+## Endpoint contracts
+### REST
+- `GET /api/identities`
+- `GET /api/identities/:id`
+- `POST /api/identities/:id/rename`
+- `POST /api/identities/:id/merge`
+- `DELETE /api/identities/:id`
+- `POST /api/identities/:id/snapshot`
+- `POST /api/identities/:id/mute`
+- `POST /webrtc/offer`
 
-## HTTP Endpoint
-- URL: `http://127.0.0.1:8080/identities`
-- Response format:
+### WebSocket
+- `ws://<host>/ws/metadata` in dev
+- `wss://<host>/ws/metadata` in production
+
+Message shape:
 ```json
 {
-  "identities": [
+  "frame_id": 12345,
+  "timestamp": "2026-02-22T14:01:10Z",
+  "tracks": [
     {
-      "id": 1,
-      "first_seen": "2026-02-21T00:00:00+00:00",
-      "last_seen": "2026-02-21T00:01:00+00:00",
-      "sample_path": "./faces/1_2026-02-21_00-00-00_00-00.jpg",
-      "last_score": 0.92,
-      "count": 8
+      "track_id": 17,
+      "bbox": [x, y, w, h],
+      "identity_id": 3,
+      "label": "ID:3 (0.82)",
+      "modality": "face",
+      "thumb": "/faces/3_last.jpg"
     }
-  ],
-  "count": 1
+  ]
 }
 ```
 
-## Test
-```bash
-python -m pytest -q tests/test_db.py
-```
+## WebRTC notes
+`/webrtc/offer` in the mock server is a signaling stub for local UI plumbing only. A real backend must:
+1. accept SDP offers
+2. generate valid SDP answers
+3. attach a media source to `RTCPeerConnection`
 
-## Notes
-- RTSP source is opened with FFmpeg backend (`cv2.CAP_FFMPEG`) and TCP hint appended when missing.
-- Reconnect backoff on decode/read failures: `0.5s -> 1s -> 2s ...` up to `10s`.
-- New identities save thumbnails to `./faces/{id}_{timestamp}.jpg`.
+If WebRTC fails, the UI falls back to `/stream.mjpeg` automatically.
+
+## Why canvas overlays preserve quality
+The `<video>` element displays the raw stream directly. Overlay annotations are drawn on a separate `<canvas>` layered above it. This avoids server-side re-encoding and keeps stream pixels unchanged while maintaining low-latency visual metadata.
+
+## Pixel-perfect mode
+LiveView includes a `Pixel-perfect` toggle. When enabled, the canvas backing store uses video resolution x DPR for sharper overlays on high-DPI displays.
+
+## Large library scaling
+For large identity sets, integrate virtualization (for example `@tanstack/react-virtual`) in `Library.tsx` grid rendering. The current implementation keeps lazy-loaded images and cheap card rendering as a baseline.
+
+## Environment overrides
+Optional env vars:
+- `VITE_API_BASE` (default `http://localhost:8080`)
+- `VITE_WS_METADATA_URL` (default `ws://localhost:8080/ws/metadata`)
+- `VITE_WEBRTC_OFFER` (default `${VITE_API_BASE}/webrtc/offer`)
+- `VITE_DISABLE_WEBRTC=true` (force MJPEG fallback)
+- `VITE_USE_MOCK=1` (enable mock proxy mode in dev config)
+
+Legacy compatibility:
+- `REACT_APP_API_URL`
+- `REACT_APP_WS_URL`
+- `REACT_APP_WEBRTC_OFFER`
+- `REACT_APP_MJPEG`
+- `REACT_APP_USE_MOCK`
+
+## Integration checklist for real backend
+1. Implement `/webrtc/offer` with full signaling/media.
+2. Emit metadata frames on `/ws/metadata` using the documented contract.
+3. Expose identity REST endpoints.
+4. Keep video raw; do not burn overlays server-side.

@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Identity Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;700;800&family=Space+Grotesk:wght@500;700&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --bg-0: #f2f7f5;
+      --bg-1: #dfeee7;
+      --surface: #ffffff;
+      --ink-0: #11231b;
+      --ink-1: #355346;
+      --accent: #0f9d72;
+      --accent-2: #ff7a18;
+      --line: #d4e2da;
+      --warn: #b31f2f;
+      --shadow: 0 14px 34px rgba(13, 44, 31, 0.12);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Manrope", "Segoe UI", sans-serif;
+      color: var(--ink-0);
+      background:
+        radial-gradient(1200px 500px at 15% -10%, #d4f4e6 0%, transparent 65%),
+        radial-gradient(1000px 460px at 105% -20%, #ffe7d4 0%, transparent 70%),
+        linear-gradient(170deg, var(--bg-0), var(--bg-1));
+      min-height: 100vh;
+    }
+    .shell {
+      max-width: 1240px;
+      margin: 0 auto;
+      padding: 28px 22px 40px;
+    }
+    .hero {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+    .title {
+      margin: 0;
+      font-family: "Space Grotesk", sans-serif;
+      font-size: clamp(1.5rem, 2.2vw, 2.1rem);
+      letter-spacing: -0.03em;
+    }
+    .subtitle {
+      margin: 7px 0 0;
+      color: var(--ink-1);
+      font-size: 0.95rem;
+    }
+    .toolbar {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr auto auto auto;
+      gap: 10px;
+      margin-bottom: 20px;
+    }
+    .input, .btn, .pill {
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.8);
+      min-height: 44px;
+    }
+    .input {
+      padding: 0 12px;
+      font-family: inherit;
+      font-size: 0.95rem;
+      color: var(--ink-0);
+    }
+    .btn {
+      padding: 0 14px;
+      cursor: pointer;
+      font-family: "Space Grotesk", sans-serif;
+      font-weight: 600;
+      color: var(--ink-0);
+      transition: transform .14s ease, box-shadow .14s ease, border-color .14s ease;
+    }
+    .btn:hover {
+      transform: translateY(-1px);
+      border-color: #a9c3b8;
+      box-shadow: 0 10px 20px rgba(17, 35, 27, 0.07);
+    }
+    .btn.primary {
+      background: linear-gradient(90deg, var(--accent), #1aba89);
+      border-color: transparent;
+      color: #f8fffc;
+    }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 0 12px;
+      font-weight: 700;
+      color: var(--ink-1);
+      min-width: 84px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+      gap: 14px;
+    }
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      background: var(--surface);
+      box-shadow: var(--shadow);
+      overflow: hidden;
+      animation: reveal .32s ease both;
+      transform-origin: center;
+      transition: transform .18s ease, box-shadow .18s ease;
+    }
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 16px 32px rgba(13, 44, 31, 0.15);
+    }
+    .media {
+      aspect-ratio: 16 / 9;
+      width: 100%;
+      object-fit: cover;
+      display: block;
+      background: linear-gradient(135deg, #eff5f2, #dcebe4);
+    }
+    .placeholder {
+      display: grid;
+      place-items: center;
+      font-family: "Space Grotesk", sans-serif;
+      color: #4c6c5f;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+    }
+    .body {
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+    .head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+    }
+    .id {
+      font-family: "Space Grotesk", sans-serif;
+      font-weight: 700;
+      font-size: 1rem;
+    }
+    .score {
+      font-size: 0.82rem;
+      color: var(--ink-1);
+      font-weight: 600;
+    }
+    .rows {
+      display: grid;
+      gap: 6px;
+    }
+    .row {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      font-size: 0.87rem;
+    }
+    .row .k { color: var(--ink-1); }
+    .actions {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+    }
+    .mini {
+      min-height: 34px;
+      border-radius: 10px;
+      padding: 0 10px;
+      font-size: 0.84rem;
+    }
+    .edit-zone {
+      display: none;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      margin-top: 2px;
+    }
+    .edit-zone.show {
+      display: grid;
+    }
+    .empty {
+      border: 1px dashed #9eb6ab;
+      border-radius: 14px;
+      padding: 36px 16px;
+      text-align: center;
+      color: #4f6f62;
+      background: rgba(255, 255, 255, 0.45);
+    }
+    .toast {
+      position: fixed;
+      right: 20px;
+      bottom: 20px;
+      padding: 12px 14px;
+      border-radius: 12px;
+      background: #133526;
+      color: #f2fff8;
+      font-size: 0.88rem;
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(6px);
+      transition: opacity .18s ease, transform .18s ease;
+      z-index: 20;
+    }
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .toast.err { background: var(--warn); }
+    @keyframes reveal {
+      from { opacity: 0; transform: translateY(8px) scale(0.99); }
+      to { opacity: 1; transform: translateY(0) scale(1); }
+    }
+    @media (max-width: 900px) {
+      .toolbar { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 560px) {
+      .toolbar { grid-template-columns: 1fr; }
+      .shell { padding: 16px 12px 30px; }
+      .grid { grid-template-columns: 1fr; }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <div class="hero">
+      <div>
+        <h1 class="title">Identity Console</h1>
+        <p class="subtitle">Local dashboard for recognized identities and ID management.</p>
+      </div>
+    </div>
+
+    <div class="toolbar">
+      <input id="searchInput" class="input" placeholder="Search by ID, timestamp, path...">
+      <input id="apiKeyInput" class="input" placeholder="API key (optional)">
+      <div id="countPill" class="pill">0 IDs</div>
+      <button id="refreshBtn" class="btn">Refresh</button>
+      <button id="autoBtn" class="btn primary">Auto: ON</button>
+    </div>
+
+    <div id="identityGrid" class="grid"></div>
+  </div>
+  <div id="toast" class="toast"></div>
+
+  <script>
+    const grid = document.getElementById("identityGrid");
+    const searchInput = document.getElementById("searchInput");
+    const refreshBtn = document.getElementById("refreshBtn");
+    const autoBtn = document.getElementById("autoBtn");
+    const countPill = document.getElementById("countPill");
+    const apiKeyInput = document.getElementById("apiKeyInput");
+    const toastEl = document.getElementById("toast");
+    const apiKeyRequired = {{ "true" if api_key_required else "false" }};
+
+    let cache = [];
+    let autoRefresh = true;
+    let timer = null;
+    let editingId = null;
+
+    const storedApiKey = window.localStorage.getItem("identity_api_key") || "";
+    apiKeyInput.value = storedApiKey;
+    if (!apiKeyRequired) {
+      apiKeyInput.placeholder = "API key (not required)";
+    }
+
+    function esc(value) {
+      return String(value ?? "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;")
+        .replaceAll('"', "&quot;")
+        .replaceAll("'", "&#39;");
+    }
+
+    function fmtTs(ts) {
+      if (!ts) return "-";
+      const d = new Date(ts);
+      if (Number.isNaN(d.getTime())) return ts;
+      return d.toLocaleString();
+    }
+
+    function showToast(msg, isErr = false) {
+      toastEl.textContent = msg;
+      toastEl.className = `toast show${isErr ? " err" : ""}`;
+      window.clearTimeout(showToast._t);
+      showToast._t = window.setTimeout(() => {
+        toastEl.className = "toast";
+      }, 1800);
+    }
+
+    function apiKeyValue() {
+      return (apiKeyInput.value || "").trim();
+    }
+
+    function buildHeaders(extra = {}) {
+      const key = apiKeyValue();
+      return key ? { ...extra, "X-API-Key": key } : extra;
+    }
+
+    function isEditing() {
+      return editingId !== null;
+    }
+
+    function setEditing(idOrNull) {
+      if (typeof idOrNull === "string" && idOrNull.trim()) {
+        editingId = idOrNull.trim();
+      } else {
+        editingId = null;
+      }
+      updateAutoLabel();
+    }
+
+    function updateAutoLabel() {
+      if (!autoRefresh) {
+        autoBtn.textContent = "Auto: OFF";
+        return;
+      }
+      autoBtn.textContent = isEditing() ? "Auto: PAUSED" : "Auto: ON";
+    }
+
+    function cardTemplate(item) {
+      const safeId = esc(item.id);
+      const media = item.sample_url
+        ? `<img class="media" src="${esc(item.sample_url)}" alt="ID ${safeId}" loading="lazy">`
+        : `<div class="media placeholder">NO IMAGE</div>`;
+
+      return `
+        <article class="card" data-id="${safeId}">
+          ${media}
+          <div class="body">
+            <div class="head">
+              <div class="id">ID:${safeId}</div>
+              <div class="score">score: ${(item.last_score ?? 0).toFixed(2)}</div>
+            </div>
+            <div class="rows">
+              <div class="row"><span class="k">First seen</span><span>${esc(fmtTs(item.first_seen))}</span></div>
+              <div class="row"><span class="k">Last seen</span><span>${esc(fmtTs(item.last_seen))}</span></div>
+              <div class="row"><span class="k">Seen count</span><span>${item.count ?? 0}</span></div>
+            </div>
+            <div class="actions">
+              <button class="btn mini edit-btn">Change ID</button>
+            </div>
+            <div class="edit-zone">
+              <input class="input mini id-input" type="text" placeholder="New ID (e.g. yassin)">
+              <button class="btn mini primary save-btn">Save</button>
+            </div>
+          </div>
+        </article>
+      `;
+    }
+
+    function render() {
+      const q = searchInput.value.trim().toLowerCase();
+      const filtered = cache.filter(item => {
+        if (!q) return true;
+        const line = `${item.id} ${item.first_seen || ""} ${item.last_seen || ""} ${item.sample_path || ""}`.toLowerCase();
+        return line.includes(q);
+      });
+
+      countPill.textContent = `${filtered.length} IDs`;
+      if (!filtered.length) {
+        grid.innerHTML = `<div class="empty">No identities match your search.</div>`;
+        return;
+      }
+      grid.innerHTML = filtered.map(cardTemplate).join("");
+    }
+
+    async function fetchIdentities() {
+      const res = await fetch("/api/identities", {
+        cache: "no-store",
+        headers: buildHeaders(),
+      });
+      if (!res.ok) throw new Error(`Failed to load identities (${res.status})`);
+      const data = await res.json();
+      cache = Array.isArray(data.identities) ? data.identities : [];
+      if (isEditing()) return;
+      render();
+    }
+
+    async function reassignIdentity(oldId, newId) {
+      const res = await fetch(`/api/identities/${encodeURIComponent(oldId)}/reassign`, {
+        method: "POST",
+        headers: buildHeaders({ "Content-Type": "application/json" }),
+        body: JSON.stringify({ new_id: newId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || !data.ok) {
+        throw new Error(data.error || `Update failed (${res.status})`);
+      }
+      showToast(`ID:${oldId} -> ID:${newId}`);
+      setEditing(null);
+      await fetchIdentities();
+    }
+
+    grid.addEventListener("click", async (event) => {
+      const editButton = event.target.closest(".edit-btn");
+      if (editButton) {
+        const card = editButton.closest(".card");
+        const zone = card.querySelector(".edit-zone");
+        if (zone.classList.contains("show")) {
+          zone.classList.remove("show");
+          setEditing(null);
+          return;
+        }
+        for (const openZone of grid.querySelectorAll(".edit-zone.show")) {
+          openZone.classList.remove("show");
+        }
+        zone.classList.add("show");
+        setEditing(String(card.dataset.id || ""));
+        const idInput = zone.querySelector(".id-input");
+        if (idInput) idInput.focus();
+        return;
+      }
+
+      const saveButton = event.target.closest(".save-btn");
+      if (!saveButton) return;
+      const card = saveButton.closest(".card");
+      const oldId = String(card.dataset.id || "").trim();
+      const input = card.querySelector(".id-input");
+      const newId = String(input.value || "").trim();
+      if (!newId) {
+        showToast("Enter a non-empty ID.", true);
+        return;
+      }
+      if (apiKeyRequired && !apiKeyValue()) {
+        showToast("API key required for ID updates.", true);
+        return;
+      }
+      if (newId === oldId) {
+        showToast("ID is unchanged.", true);
+        return;
+      }
+      saveButton.disabled = true;
+      try {
+        await reassignIdentity(oldId, newId);
+      } catch (err) {
+        if (String(err.message || "").toLowerCase().includes("unauthorized")) {
+          showToast("Unauthorized. Check your API key.", true);
+        } else {
+        showToast(err.message || "Unable to update ID.", true);
+        }
+      } finally {
+        saveButton.disabled = false;
+      }
+    });
+
+    searchInput.addEventListener("input", render);
+    refreshBtn.addEventListener("click", async () => {
+      if (isEditing()) {
+        showToast("Finish editing first, or close the edit panel.", true);
+        return;
+      }
+      try {
+        await fetchIdentities();
+      } catch (err) {
+        showToast(err.message || "Refresh failed.", true);
+      }
+    });
+    apiKeyInput.addEventListener("change", () => {
+      window.localStorage.setItem("identity_api_key", apiKeyValue());
+    });
+    autoBtn.addEventListener("click", () => {
+      autoRefresh = !autoRefresh;
+      updateAutoLabel();
+      autoBtn.classList.toggle("primary", autoRefresh);
+      if (autoRefresh && !timer) {
+        timer = setInterval(() => {
+          if (autoRefresh && !isEditing()) fetchIdentities().catch(() => {});
+        }, 3000);
+      }
+      if (!autoRefresh && timer) {
+        clearInterval(timer);
+        timer = null;
+      }
+    });
+
+    updateAutoLabel();
+    fetchIdentities().catch(err => showToast(err.message || "Initial load failed.", true));
+    timer = setInterval(() => {
+      if (autoRefresh && !isEditing()) fetchIdentities().catch(() => {});
+    }, 3000);
+  </script>
+</body>
+</html>

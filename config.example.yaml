@@ -1,0 +1,18 @@
+RTSP_URL: "rtsp://username:password@camera-ip:554/stream1"
+cosine_threshold: 0.88
+skip_n: 2
+imgsz: [640, 360]
+db_path: "./identities.db"
+faces_dir: "./faces"
+http_host: "127.0.0.1"
+http_port: 8080
+http_use_waitress: true
+api_key: ""
+cache_seconds: 30
+cache_reuse_seconds: 0.75
+display_window: true
+debug: false
+debug_faces_dir: "./debug_faces"
+debug_threshold: null
+detector_model_selection: 0
+detector_min_confidence: 0.3
