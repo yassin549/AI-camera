@@ -1,0 +1,17 @@
+version: "3.8"
+
+services:
+  janus:
+    image: ghcr.io/meetecho/janus-gateway:latest
+    container_name: aicam-janus
+    restart: unless-stopped
+    ports:
+      - "7088:7088"
+      - "8088:8088"
+      - "8188:8188"
+      - "10000-10200:10000-10200/udp"
+    volumes:
+      - ./janus/etc/janus:/opt/janus/etc/janus
+      - ./janus/log:/opt/janus/log
+    environment:
+      - TZ=UTC

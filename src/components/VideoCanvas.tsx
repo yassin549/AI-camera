@@ -1,7 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
-  HttpError,
-  postWebRtcOffer,
   resolveMetadataWsUrl,
   type MetadataPayload,
   type TrackPayload
@@ -15,13 +13,15 @@ interface VideoCanvasProps {
   pixelPerfect?: boolean;
   focusedTrackId?: number | null;
   metadataUrl?: string;
-  webrtcOfferUrl?: string;
+  janusHttpUrl?: string;
+  janusMountpoint?: number;
+  videoWsUrl?: string;
   fallbackSrc?: string;
   onTrackFocus?: (track: TrackPayload | null) => void;
   onRosterChange?: (tracks: TrackPayload[]) => void;
 }
 
-type TransportMode = "connecting" | "webrtc" | "mjpeg";
+type TransportMode = "connecting" | "janus" | "wsjpeg" | "mjpeg";
 
 interface ProjectedTrack {
   track: TrackPayload;
@@ -101,24 +101,28 @@ function resolveApiUrl(pathOrUrl: string): string {
   return `${base}${path}`;
 }
 
-function waitForIceGatheringComplete(pc: RTCPeerConnection, timeoutMs = 1500): Promise<void> {
-  if (pc.iceGatheringState === "complete") {
-    return Promise.resolve();
+function resolveWsUrl(pathOrUrl: string): string {
+  if (!pathOrUrl) {
+    return "";
   }
-  return new Promise((resolve) => {
-    const timer = window.setTimeout(() => {
-      pc.removeEventListener("icegatheringstatechange", onStateChange);
-      resolve();
-    }, timeoutMs);
-    const onStateChange = () => {
-      if (pc.iceGatheringState === "complete") {
-        window.clearTimeout(timer);
-        pc.removeEventListener("icegatheringstatechange", onStateChange);
-        resolve();
-      }
-    };
-    pc.addEventListener("icegatheringstatechange", onStateChange);
-  });
+  if (/^wss?:\/\//i.test(pathOrUrl)) {
+    return pathOrUrl;
+  }
+  if (/^https?:\/\//i.test(pathOrUrl)) {
+    return pathOrUrl.replace(/^http/i, "ws");
+  }
+  if (pathOrUrl.startsWith("/")) {
+    if (API.REST_BASE && /^https?:\/\//i.test(API.REST_BASE)) {
+      return `${API.REST_BASE.replace(/^http/i, "ws").replace(/\/+$/, "")}${pathOrUrl}`;
+    }
+    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+    return `${protocol}//${window.location.host}${pathOrUrl}`;
+  }
+  return pathOrUrl;
+}
+
+function nextTx(): string {
+  return Math.random().toString(36).slice(2, 12);
 }
 
 export function VideoCanvas({
@@ -127,13 +131,20 @@ export function VideoCanvas({
   pixelPerfect = true,
   focusedTrackId = null,
   metadataUrl,
-  webrtcOfferUrl = API.WEBRTC_OFFER,
+  janusHttpUrl = API.JANUS_HTTP,
+  janusMountpoint = API.JANUS_MOUNTPOINT,
+  videoWsUrl = API.VIDEO_WS,
   fallbackSrc = API.MJPEG_FALLBACK,
   onTrackFocus,
   onRosterChange
 }: VideoCanvasProps): JSX.Element {
   const resolvedWsUrl = useMemo(() => metadataUrl ?? resolveMetadataWsUrl(), [metadataUrl]);
-  const resolvedWebRtcOfferUrl = useMemo(() => resolveApiUrl(webrtcOfferUrl), [webrtcOfferUrl]);
+  const resolvedJanusHttpUrl = useMemo(() => resolveApiUrl(janusHttpUrl).replace(/\/+$/, ""), [janusHttpUrl]);
+  const resolvedJanusMountpoint = useMemo(
+    () => (Number.isFinite(janusMountpoint) && Number(janusMountpoint) > 0 ? Number(janusMountpoint) : 1),
+    [janusMountpoint]
+  );
+  const resolvedVideoWsUrl = useMemo(() => resolveWsUrl(videoWsUrl), [videoWsUrl]);
   const resolvedFallbackSrc = useMemo(() => resolveApiUrl(fallbackSrc), [fallbackSrc]);
   const disableWebRtc = (import.meta.env.VITE_DISABLE_WEBRTC as string | undefined) === "true";
   const containerRef = useRef<HTMLDivElement | null>(null);
@@ -147,7 +158,13 @@ export function VideoCanvas({
   const metricsRef = useRef<CanvasMetrics>({ cssWidth: 0, cssHeight: 0, sourceWidth: 0, sourceHeight: 0 });
   const resizeKeyRef = useRef(0);
   const rafRef = useRef<number | null>(null);
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null);
+  const janusPcRef = useRef<RTCPeerConnection | null>(null);
+  const janusAbortRef = useRef<AbortController | null>(null);
+  const janusSessionRef = useRef<number | null>(null);
+  const janusHandleRef = useRef<number | null>(null);
+  const janusKeepaliveRef = useRef<number | null>(null);
+  const wsVideoRef = useRef<WebSocket | null>(null);
+  const wsBlobUrlRef = useRef<string | null>(null);
   const transportModeRef = useRef<TransportMode>("connecting");
 
   const [transportMode, setTransportMode] = useState<TransportMode>("connecting");
@@ -170,25 +187,74 @@ export function VideoCanvas({
     }
   });
 
-  const closePeerConnection = () => {
-    const pc = peerConnectionRef.current;
+  const closeJanusTransport = () => {
+    if (janusKeepaliveRef.current !== null) {
+      window.clearInterval(janusKeepaliveRef.current);
+      janusKeepaliveRef.current = null;
+    }
+    const abort = janusAbortRef.current;
+    if (abort) {
+      abort.abort();
+      janusAbortRef.current = null;
+    }
+    const pc = janusPcRef.current;
     if (!pc) {
+      // continue: session may still need cleanup.
+    } else {
+      pc.ontrack = null;
+      pc.onicecandidate = null;
+      pc.close();
+      janusPcRef.current = null;
+    }
+
+    const sessionId = janusSessionRef.current;
+    janusSessionRef.current = null;
+    janusHandleRef.current = null;
+    if (!sessionId) {
       return;
     }
-    pc.ontrack = null;
-    pc.oniceconnectionstatechange = null;
-    pc.close();
-    peerConnectionRef.current = null;
+    const payload = {
+      janus: "destroy",
+      transaction: nextTx(),
+    };
+    void fetch(`${resolvedJanusHttpUrl}/${sessionId}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).catch(() => undefined);
   };
 
-  const activateFallback = () => {
-    closePeerConnection();
+  const releaseWsBlobUrl = () => {
+    const url = wsBlobUrlRef.current;
+    if (!url) {
+      return;
+    }
+    window.URL.revokeObjectURL(url);
+    wsBlobUrlRef.current = null;
+  };
+
+  const closeWsVideo = () => {
+    const ws = wsVideoRef.current;
+    if (ws) {
+      ws.onopen = null;
+      ws.onclose = null;
+      ws.onerror = null;
+      ws.onmessage = null;
+      ws.close();
+      wsVideoRef.current = null;
+    }
+    releaseWsBlobUrl();
+  };
+
+  const activateMjpegFallback = () => {
     const video = videoRef.current;
     if (video) {
       video.srcObject = null;
       video.removeAttribute("src");
       video.style.display = "none";
     }
+    closeJanusTransport();
+    closeWsVideo();
     const img = mjpegImgRef.current;
     if (img) {
       img.src = resolvedFallbackSrc;
@@ -198,12 +264,93 @@ export function VideoCanvas({
     setTransportMode("mjpeg");
   };
 
+  const activateWsJpegFallback = async (): Promise<boolean> => {
+    if (!resolvedVideoWsUrl) {
+      return false;
+    }
+    const img = mjpegImgRef.current;
+    if (!img) {
+      return false;
+    }
+    closeWsVideo();
+    closeJanusTransport();
+    img.style.display = "block";
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (ok: boolean) => {
+        if (settled) {
+          return;
+        }
+        settled = true;
+        resolve(ok);
+      };
+
+      try {
+        const ws = new WebSocket(resolvedVideoWsUrl);
+        ws.binaryType = "arraybuffer";
+        wsVideoRef.current = ws;
+        const timeout = window.setTimeout(() => {
+          if (ws.readyState !== WebSocket.OPEN) {
+            ws.close();
+            finish(false);
+          }
+        }, 1500);
+
+        ws.onopen = () => {
+          window.clearTimeout(timeout);
+          transportModeRef.current = "wsjpeg";
+          setTransportMode("wsjpeg");
+          finish(true);
+        };
+
+        ws.onmessage = (event) => {
+          const payload =
+            event.data instanceof Blob
+              ? event.data
+              : new Blob([event.data as ArrayBuffer], { type: "image/jpeg" });
+          const nextUrl = window.URL.createObjectURL(payload);
+          const previous = wsBlobUrlRef.current;
+          wsBlobUrlRef.current = nextUrl;
+          img.src = nextUrl;
+          if (previous) {
+            window.setTimeout(() => window.URL.revokeObjectURL(previous), 1200);
+          }
+        };
+
+        ws.onerror = () => {
+          window.clearTimeout(timeout);
+          if (ws.readyState !== WebSocket.OPEN) {
+            finish(false);
+          }
+        };
+
+        ws.onclose = () => {
+          window.clearTimeout(timeout);
+          if (wsVideoRef.current === ws) {
+            wsVideoRef.current = null;
+          }
+          if (!settled) {
+            finish(false);
+            return;
+          }
+          if (transportModeRef.current === "wsjpeg") {
+            activateMjpegFallback();
+          }
+        };
+      } catch {
+        finish(false);
+      }
+    });
+  };
+
   useEffect(() => {
     let cancelled = false;
     const video = videoRef.current;
     const img = mjpegImgRef.current;
     if (!active) {
-      closePeerConnection();
+      closeJanusTransport();
+      closeWsVideo();
       if (video) {
         video.pause();
         video.srcObject = null;
@@ -221,79 +368,206 @@ export function VideoCanvas({
       return;
     }
 
-    const bootstrapWebRtc = async () => {
-      if (disableWebRtc) {
-        activateFallback();
-        return;
+    const janusPost = async (
+      path: string,
+      body: Record<string, unknown>,
+      signal: AbortSignal
+    ): Promise<Record<string, unknown>> => {
+      const response = await fetch(`${resolvedJanusHttpUrl}${path}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...body, transaction: nextTx() }),
+        signal,
+      });
+      if (!response.ok) {
+        throw new Error(`Janus HTTP ${response.status}`);
       }
-      if (typeof RTCPeerConnection === "undefined") {
-        setTransportError("WebRTC is unavailable in this browser");
-        activateFallback();
-        return;
+      return (await response.json()) as Record<string, unknown>;
+    };
+
+    const startJanusTransport = async (): Promise<boolean> => {
+      if (!resolvedJanusHttpUrl || typeof RTCPeerConnection === "undefined") {
+        return false;
       }
-      setTransportMode("connecting");
+      const abort = new AbortController();
+      const signal = abort.signal;
+      janusAbortRef.current = abort;
+      let sessionId: number | null = null;
+      let handleId: number | null = null;
       try {
+        const created = await janusPost("", { janus: "create" }, signal);
+        sessionId = Number((created.data as { id?: number } | undefined)?.id ?? -1);
+        if (!Number.isFinite(sessionId) || sessionId <= 0) {
+          throw new Error("Janus create session failed");
+        }
+
+        const attached = await janusPost(
+          `/${sessionId}`,
+          { janus: "attach", plugin: "janus.plugin.streaming" },
+          signal
+        );
+        handleId = Number((attached.data as { id?: number } | undefined)?.id ?? -1);
+        if (!Number.isFinite(handleId) || handleId <= 0) {
+          throw new Error("Janus attach plugin failed");
+        }
+
+        janusSessionRef.current = sessionId;
+        janusHandleRef.current = handleId;
         const pc = new RTCPeerConnection();
-        peerConnectionRef.current = pc;
-        pc.addTransceiver("video", { direction: "recvonly" });
+        janusPcRef.current = pc;
         pc.ontrack = (event) => {
           if (event.streams[0]) {
-            video.style.display = "block";
+            closeWsVideo();
             if (img) {
               img.removeAttribute("src");
               img.style.display = "none";
             }
+            video.style.display = "block";
             video.srcObject = event.streams[0];
-            video.play().catch(() => {
-              // Browser autoplay policy can block without user interaction.
-            });
+            video.play().catch(() => undefined);
+            transportModeRef.current = "janus";
+            setTransportMode("janus");
+            setTransportError(null);
           }
         };
-        pc.oniceconnectionstatechange = () => {
-          if (pc.iceConnectionState === "failed" || pc.iceConnectionState === "disconnected") {
-            activateFallback();
+        pc.onicecandidate = (event) => {
+          const sid = janusSessionRef.current;
+          const hid = janusHandleRef.current;
+          if (!sid || !hid || signal.aborted) {
+            return;
           }
+          void janusPost(
+            `/${sid}/${hid}`,
+            {
+              janus: "trickle",
+              candidate: event.candidate ?? { completed: true },
+            },
+            signal
+          ).catch(() => undefined);
         };
 
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        await waitForIceGatheringComplete(pc);
-
-        const answer = await postWebRtcOffer(
-          {
-            sdp: pc.localDescription?.sdp ?? offer.sdp ?? "",
-            type: "offer"
-          },
-          resolvedWebRtcOfferUrl
+        await janusPost(
+          `/${sessionId}/${handleId}`,
+          { janus: "message", body: { request: "watch", id: resolvedJanusMountpoint } },
+          signal
         );
-        if (cancelled) {
-          return;
-        }
 
-        await pc.setRemoteDescription(answer);
-        setTransportError(null);
-        transportModeRef.current = "webrtc";
-        setTransportMode("webrtc");
-      } catch (err) {
-        if (cancelled) {
-          return;
+        janusKeepaliveRef.current = window.setInterval(() => {
+          if (signal.aborted || !janusSessionRef.current) {
+            return;
+          }
+          void janusPost(
+            `/${janusSessionRef.current}`,
+            { janus: "keepalive" },
+            signal
+          ).catch(() => undefined);
+        }, 25000);
+
+        const pollEvents = async () => {
+          while (!signal.aborted && janusSessionRef.current && janusHandleRef.current) {
+            const rid = Date.now();
+            const response = await fetch(
+              `${resolvedJanusHttpUrl}/${janusSessionRef.current}?rid=${rid}&maxev=1`,
+              { signal }
+            );
+            if (!response.ok) {
+              throw new Error(`Janus poll ${response.status}`);
+            }
+            const event = (await response.json()) as Record<string, unknown>;
+            const eventSender = Number(event.sender ?? -1);
+
+            if (
+              event.janus === "event" &&
+              eventSender === janusHandleRef.current &&
+              event.jsep &&
+              typeof event.jsep === "object" &&
+              janusPcRef.current
+            ) {
+              const remote = event.jsep as RTCSessionDescriptionInit;
+              await janusPcRef.current.setRemoteDescription(remote);
+              const answer = await janusPcRef.current.createAnswer();
+              await janusPcRef.current.setLocalDescription(answer);
+              await janusPost(
+                `/${janusSessionRef.current}/${janusHandleRef.current}`,
+                {
+                  janus: "message",
+                  body: { request: "start" },
+                  jsep: janusPcRef.current.localDescription,
+                },
+                signal
+              );
+            }
+
+            if (
+              event.janus === "trickle" &&
+              eventSender === janusHandleRef.current &&
+              event.candidate &&
+              janusPcRef.current
+            ) {
+              const candidate = event.candidate as { completed?: boolean; candidate?: string };
+              try {
+                await janusPcRef.current.addIceCandidate(candidate.completed ? null : (candidate as RTCIceCandidateInit));
+              } catch {
+                // Ignore invalid trickle candidates and continue polling.
+              }
+            }
+          }
+        };
+
+        void pollEvents().catch(async (err: unknown) => {
+          if (signal.aborted || cancelled) {
+            return;
+          }
+          const message = err instanceof Error ? err.message : "Janus polling failed";
+          setTransportError(`Janus stream error: ${message}`);
+          const wsReady = await activateWsJpegFallback();
+          if (!wsReady) {
+            activateMjpegFallback();
+          }
+        });
+
+        return true;
+      } catch {
+        if (sessionId && !signal.aborted) {
+          void janusPost(`/${sessionId}`, { janus: "destroy" }, signal).catch(() => undefined);
         }
-        const message = err instanceof Error ? err.message : "WebRTC signaling failed";
-        const expectedFallback =
-          (err instanceof HttpError && err.status === 503) ||
-          /disabled \(aiortc unavailable\)/i.test(message);
-        setTransportError(expectedFallback ? null : message);
-        activateFallback();
+        closeJanusTransport();
+        return false;
       }
     };
 
-    bootstrapWebRtc();
+    const bootstrapVideo = async () => {
+      if (disableWebRtc) {
+        setTransportError("WebRTC disabled by VITE_DISABLE_WEBRTC; using fallback transport");
+        const wsReady = await activateWsJpegFallback();
+        if (!wsReady) {
+          activateMjpegFallback();
+        }
+        return;
+      }
+
+      setTransportMode("connecting");
+      const janusReady = await startJanusTransport();
+      if (cancelled) {
+        return;
+      }
+      if (!janusReady) {
+        setTransportError("Janus WebRTC unavailable; using fallback transport");
+        const wsReady = await activateWsJpegFallback();
+        if (!wsReady) {
+          activateMjpegFallback();
+        }
+      }
+    };
+
+    bootstrapVideo();
 
     return () => {
       cancelled = true;
-      closePeerConnection();
+      closeJanusTransport();
+      closeWsVideo();
     };
-  }, [active, disableWebRtc, resolvedFallbackSrc, resolvedWebRtcOfferUrl]);
+  }, [active, disableWebRtc, resolvedFallbackSrc, resolvedJanusHttpUrl, resolvedJanusMountpoint, resolvedVideoWsUrl]);
 
   useEffect(() => {
     if (!active) {
@@ -315,7 +589,6 @@ export function VideoCanvas({
   }, []);
 
   useEffect(() => {
-    let mjpegFrameKey = 0;
     const draw = () => {
       const canvas = canvasRef.current;
       const video = videoRef.current;
@@ -326,12 +599,13 @@ export function VideoCanvas({
         return;
       }
 
-      const isMjpeg = transportModeRef.current === "mjpeg";
+      const isImageFallback =
+        transportModeRef.current === "mjpeg" || transportModeRef.current === "wsjpeg";
 
       // Determine source dimensions from the active media element
       let nativeW = 0;
       let nativeH = 0;
-      if (isMjpeg && img) {
+      if (isImageFallback && img) {
         nativeW = img.naturalWidth;
         nativeH = img.naturalHeight;
       } else if (video) {
@@ -376,15 +650,11 @@ export function VideoCanvas({
         sourceHeight
       };
 
-      // For MJPEG mode, always redraw because the <img> updates in-place
       const latest = latestMetadataRef.current;
-      const currentMjpegKey = isMjpeg ? ++mjpegFrameKey : 0;
-      const sizeKey = `${cssWidth}x${cssHeight}:${sourceWidth}x${sourceHeight}:${resizeKeyRef.current
-        }:${pixelPerfect ? "pp" : "fit"}:${isMjpeg ? currentMjpegKey : ""}`;
+      const sizeKey = `${cssWidth}x${cssHeight}:${sourceWidth}x${sourceHeight}:${resizeKeyRef.current}:${pixelPerfect ? "pp" : "fit"}`;
       const latestFrameId = latest?.frame_id ?? -1;
       const cache = drawCacheRef.current;
       const shouldDraw =
-        isMjpeg ||
         cache.frameId !== latestFrameId ||
         cache.sizeKey !== sizeKey ||
         cache.focusedTrackId !== focusedTrackId;
@@ -399,16 +669,6 @@ export function VideoCanvas({
 
       ctx.clearRect(0, 0, cssWidth, cssHeight);
       projectedTracksRef.current = [];
-
-      // In MJPEG mode, draw the <img> onto the canvas as the video background
-      if (isMjpeg && img && img.complete && img.naturalWidth > 0) {
-        const fitScale = Math.min(cssWidth / img.naturalWidth, cssHeight / img.naturalHeight);
-        const drawW = img.naturalWidth * fitScale;
-        const drawH = img.naturalHeight * fitScale;
-        const drawX = (cssWidth - drawW) / 2;
-        const drawY = (cssHeight - drawH) / 2;
-        ctx.drawImage(img, drawX, drawY, drawW, drawH);
-      }
 
       if (!latest || sourceWidth < 2 || sourceHeight < 2) {
         rafRef.current = window.requestAnimationFrame(draw);
@@ -520,14 +780,14 @@ export function VideoCanvas({
         muted
         playsInline
         className="h-full w-full object-contain"
-        style={{ display: transportMode === "mjpeg" ? "none" : "block" }}
+        style={{ display: transportMode === "janus" ? "block" : "none" }}
         aria-label="Live camera stream"
       />
-      {/* Hidden MJPEG <img> — browsers can render multipart/x-mixed-replace on <img> but not <video> */}
       <img
         ref={mjpegImgRef}
-        alt="MJPEG live stream"
-        style={{ display: "none", position: "absolute", width: 0, height: 0, pointerEvents: "none" }}
+        alt="Fallback live stream"
+        className="h-full w-full object-contain"
+        style={{ display: transportMode === "mjpeg" || transportMode === "wsjpeg" ? "block" : "none" }}
       />
       <canvas
         ref={canvasRef}
@@ -543,7 +803,7 @@ export function VideoCanvas({
       </div>
       {transportError ? (
         <div className="pointer-events-none absolute right-3 top-3 rounded-lg bg-amber-300/90 px-3 py-2 text-xs font-medium text-slate-950 shadow-soft">
-          WebRTC failed, MJPEG fallback active ({transportError})
+          Live stream fallback active ({transportError})
         </div>
       ) : null}
       {realtime.error ? (

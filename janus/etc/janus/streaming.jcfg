@@ -1,0 +1,18 @@
+# Janus streaming plugin config for AIcam camera relay.
+# Replace YOUR_PASS and camera IP before starting Janus.
+
+general: {
+  enabled = yes
+}
+
+streams: (
+  {
+    id = 1
+    description = "AIcam Camera 1"
+    type = "rtsp"
+    audio = no
+    video = yes
+    url = "rtsp://pyuser:YOUR_PASS@192.168.1.70:554/cam/realmonitor?channel=1&subtype=0"
+    offer_video = yes
+  }
+)

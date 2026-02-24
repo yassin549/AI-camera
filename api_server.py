@@ -24,6 +24,7 @@ from config import (
     APP_NAME,
     APP_VERSION,
     CORS_ORIGINS,
+    ENABLE_FRAME_STREAMING,
     HEALTH_FRAME_STALE_SEC,
     MJPEG_JPEG_QUALITY,
     STATIC_PATH,
@@ -39,25 +40,34 @@ def _utc_now_iso() -> str:
 def _to_media_url(raw_path: Optional[str], media_root: Path) -> Optional[str]:
     if not raw_path:
         return None
-    media_root = media_root.resolve()
+
     sample = Path(str(raw_path))
-    candidates: List[Path] = []
+    candidate_rel_paths: List[Path] = []
     if sample.is_absolute():
-        candidates.append(sample)
+        try:
+            candidate_rel_paths.append(sample.relative_to(media_root))
+        except Exception:
+            candidate_rel_paths = []
     else:
-        candidates.append((media_root / sample).resolve())
-        candidates.append((Path.cwd() / sample).resolve())
+        normalized = Path(str(sample).replace("\\", "/").lstrip("/"))
+        candidate_rel_paths.append(normalized)
+
     if sample.name:
         for subdir in ("faces", "body", "bodies", "samples/faces", "samples/bodies", "data/faces", "data/bodies"):
-            candidates.append((media_root / subdir / sample.name).resolve())
+            candidate_rel_paths.append(Path(subdir) / sample.name)
 
-    for candidate in candidates:
+    seen: Set[str] = set()
+    for rel in candidate_rel_paths:
+        rel_key = rel.as_posix()
+        if rel_key in seen:
+            continue
+        seen.add(rel_key)
+        candidate = media_root / rel
         try:
-            rel = candidate.resolve().relative_to(media_root)
+            if candidate.exists() and candidate.is_file():
+                return f"/media/{rel_key}"
         except Exception:
             continue
-        if candidate.exists():
-            return f"/media/{rel.as_posix()}"
     return None
 
 
@@ -82,7 +92,7 @@ def _discover_face_thumb(identity_id: int, media_root: Path) -> Optional[str]:
                 continue
             candidate = matches[0]
             try:
-                rel = candidate.resolve().relative_to(media_root.resolve())
+                rel = candidate.relative_to(media_root)
             except Exception:
                 continue
             return f"/media/{rel.as_posix()}"
@@ -113,7 +123,8 @@ class ApiRuntimeState:
     def __init__(self, frame_store: Any, db_path: str, media_root: Optional[str] = None) -> None:
         self.frame_store = frame_store
         self.db_path = str(db_path)
-        self.media_root = Path(media_root or STATIC_PATH).resolve()
+        self.media_root = Path(media_root or STATIC_PATH)
+        self.enable_frame_streaming = bool(ENABLE_FRAME_STREAMING)
 
         self._tracks_lock = threading.RLock()
         self._tracks: Dict[int, Dict[str, Any]] = {}
@@ -212,7 +223,9 @@ class ApiRuntimeState:
             self._latest_frame_id = int(frame_id)
             self._latest_frame_ts = time.time()
 
-    def get_latest_jpeg(self) -> bytes:
+    def get_latest_jpeg_packet(self) -> Tuple[int, bytes]:
+        if not self.enable_frame_streaming:
+            return -1, self._placeholder_jpeg
         packet = self.frame_store.get_latest()
         if packet is not None:
             with self._frame_lock:
@@ -225,9 +238,9 @@ class ApiRuntimeState:
             frame = self._latest_frame
             frame_id = self._latest_frame_id
             if frame is None:
-                return self._placeholder_jpeg
+                return -1, self._placeholder_jpeg
             if self._latest_jpeg is not None and self._latest_jpeg_frame_id == frame_id:
-                return self._latest_jpeg
+                return frame_id, self._latest_jpeg
 
         try:
             ok, encoded = cv2.imencode(
@@ -236,15 +249,19 @@ class ApiRuntimeState:
                 [int(cv2.IMWRITE_JPEG_QUALITY), int(MJPEG_JPEG_QUALITY)],
             )
             if not ok:
-                return self._placeholder_jpeg
+                return frame_id, self._placeholder_jpeg
             jpeg = encoded.tobytes()
         except Exception:
             LOGGER.debug("Failed to encode latest MJPEG frame", exc_info=True)
-            return self._placeholder_jpeg
+            return frame_id, self._placeholder_jpeg
 
         with self._frame_lock:
             self._latest_jpeg = jpeg
             self._latest_jpeg_frame_id = frame_id
+        return frame_id, jpeg
+
+    def get_latest_jpeg(self) -> bytes:
+        _frame_id, jpeg = self.get_latest_jpeg_packet()
         return jpeg
 
     def get_tracks(self) -> List[Dict[str, Any]]:
@@ -257,13 +274,17 @@ class ApiRuntimeState:
         frame_id: int,
         frame_shape: Tuple[int, int, int],
     ) -> None:
-        packet = self.frame_store.get_latest()
-        if packet is not None:
-            self.update_frame(packet.frame, int(packet.frame_id))
+        if self.enable_frame_streaming:
+            packet = self.frame_store.get_latest()
+            if packet is not None:
+                self.update_frame(packet.frame, int(packet.frame_id))
         with self._tracks_lock:
             self._tracks = {int(k): dict(v) for k, v in tracks_payload.items()}
-        metadata = self._build_metadata_payload(frame_id=frame_id, frame_shape=frame_shape, tracks=tracks_payload)
-        self.metadata_hub.publish(metadata)
+        try:
+            metadata = self._build_metadata_payload(frame_id=frame_id, frame_shape=frame_shape, tracks=tracks_payload)
+            self.metadata_hub.publish(metadata)
+        except Exception:
+            LOGGER.exception("publish_tracks failed | frame_id=%s", frame_id)
 
     def _refresh_thumb_cache_if_needed(self) -> None:
         now = time.time()
@@ -383,16 +404,18 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
             "name": APP_NAME,
             "version": APP_VERSION,
             "status": "ok",
+            "frame_streaming_enabled": runtime.enable_frame_streaming,
             "routes": [
                 "/api/identities",
                 "/api/identities/{id}",
                 "/api/realtime/ws",
                 "/webrtc/offer",
                 "/api/media/mjpeg",
+                "/api/media/ws",
             ],
         }
         if not AIORTC_AVAILABLE:
-            payload["webrtc"] = "disabled (aiortc unavailable); use /api/media/mjpeg"
+            payload["webrtc"] = "disabled (aiortc unavailable); use Janus WebRTC gateway"
         return payload
 
     @app.get("/api/health")
@@ -438,6 +461,7 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
             "mjpeg_clients": mjpeg_clients,
             "ws_clients": ws_clients,
             "identities_count": identities_count,
+            "frame_streaming_enabled": runtime.enable_frame_streaming,
         }
 
     @app.on_event("startup")

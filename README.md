@@ -1,159 +1,131 @@
-﻿# AIcam Premium UI
+# AIcam: Janus WebRTC + Metadata Overlay
 
-Production-ready React + TypeScript frontend for AIcam with:
-- raw low-latency video transport via WebRTC (offer flow)
-- automatic MJPEG fallback (`/stream.mjpeg`)
-- client-side canvas overlays (boxes, labels, thumbs)
-- realtime metadata via WebSocket (`/ws/metadata`)
-- premium Live + Library UX with Framer Motion and Headless UI
+AIcam now uses a media-gateway architecture:
+- Browser video path: camera RTSP/H264 -> Janus WebRTC -> `<video>` (hardware decode).
+- Python path: detection/tracking/identity only -> metadata WebSocket (`/api/realtime/ws`).
+- Overlay path: metadata WS -> canvas draw over video.
 
-## Stack
-- React 18 + TypeScript (hooks)
-- Vite
-- Tailwind CSS
-- Framer Motion
-- Headless UI
-- Jest + React Testing Library
-- Node mock server (`/mock/server.js`)
+Python frame streaming endpoints (`/api/media/mjpeg`, `/api/media/ws`) are still available as optional fallback but disabled by default.
 
-## Project structure
-- `src/main.tsx` app bootstrap + router + global providers
-- `src/App.tsx` top bar + PremiumSwitch + route orchestration
-- `src/pages/LiveView.tsx` video surface + overlays + roster + quick actions
-- `src/pages/Library.tsx` identities grid, search, sort
-- `src/pages/IdentityDetail.tsx` full-screen identity detail + actions
-- `src/components/PremiumSwitch.tsx` accessible tab switch
-- `src/components/VideoCanvas.tsx` WebRTC + fallback + canvas + click/focus
-- `src/components/IdentityCard.tsx` compact library card
-- `src/hooks/useRealtime.ts` WebSocket lifecycle + reconnection/backoff
-- `src/config.ts` runtime endpoint + mock config
-- `src/api/client.ts` typed API wrappers + payload normalization
-- `src/styles/global.css` premium palette + glassmorphism tokens
-- `src/__tests__/IdentityCard.test.tsx` smoke test for card -> detail route
-- `mock/server.js` mock REST + WS metadata + MJPEG + WebRTC answer stub
+## Why this architecture
+- Python JPEG/MJPEG encode loops are CPU-heavy and add latency.
+- WS-JPEG full-frame transport is bandwidth-heavy and jittery.
+- Relaying already encoded H264 through WebRTC keeps latency low and CPU usage much lower on i5-class CPUs.
 
-## Prerequisites
-- Node.js 18+ (Node 20 recommended)
-- npm 9+
+## Files added for gateway setup
+- `docker-compose.yml`
+- `janus/etc/janus/streaming.jcfg`
+- `janus/test-player.html`
+- `scripts/start-janus.sh`
+- `scripts/ffmpeg-push.sh`
 
-## Quick Start (Mock Backend)
-1. Install dependencies:
+## Run locally
+1. Start Janus:
+```bash
+docker compose up -d janus
+```
+
+2. Configure Janus mountpoint:
+- Edit `janus/etc/janus/streaming.jcfg`.
+- Set camera URL and password in `url = "rtsp://..."`.
+
+3. Start Python backend:
+```bash
+python -m venv .venv
+# Linux/macOS:
+source .venv/bin/activate
+# Windows PowerShell:
+# .\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python main.py --config config.yaml --start-api
+```
+
+4. Start frontend:
 ```bash
 npm i
-```
-2. Start the mock backend:
-```bash
-npm run mock
-```
-3. In a second terminal, start the frontend in mock mode:
-```bash
-npm run dev:mock
-```
-4. Open `http://localhost:5173`.
-
-PowerShell example:
-```powershell
-npm i
-Start-Process powershell -ArgumentList "-NoExit","-Command","cd '$PWD'; npm run mock"
-npm run dev:mock
-```
-
-## Run Against Real AIcam Backend
-1. Ensure your backend serves:
-   - `GET /api/identities`
-   - `GET /api/identities/:id`
-   - `POST /webrtc/offer`
-   - `ws://.../ws/metadata` (or `wss://.../ws/metadata`)
-2. Set environment overrides and run:
-```powershell
-$env:VITE_API_BASE='http://127.0.0.1:8080'
-$env:VITE_WS_METADATA_URL='ws://127.0.0.1:8080/ws/metadata'
 npm run dev
 ```
 
-## Force MJPEG Fallback (Disable WebRTC)
-```bash
-VITE_DISABLE_WEBRTC=true npm run dev
-```
-PowerShell:
-```powershell
-$env:VITE_DISABLE_WEBRTC='true'; npm run dev
-```
+5. Open:
+- `http://localhost:5173`
+- Live page should show `Video: JANUS` in the status badge.
 
-## Scripts
-- `npm run dev` start Vite dev server (real backend defaults)
-- `npm run dev:mock` start Vite dev server with mock-target proxy config
-- `npm run build` type-check + production build
-- `npm run test` run Jest/RTL tests
-- `npm run mock` run local mock backend on `http://localhost:8787`
+## Frontend environment (optional)
+- `VITE_API_BASE` default: `http://localhost:8080`
+- `VITE_WS_METADATA_URL` default: `ws://localhost:8080/ws/metadata`
+- `VITE_JANUS_HTTP_URL` default: `http://localhost:8088/janus`
+- `VITE_JANUS_MOUNTPOINT` default: `1`
+- `VITE_VIDEO_WS_URL` default: `/api/media/ws`
+- `VITE_DISABLE_WEBRTC=true` forces fallback chain (`WS-JPEG -> MJPEG`)
 
-## Endpoint contracts
-### REST
-- `GET /api/identities`
-- `GET /api/identities/:id`
-- `POST /api/identities/:id/rename`
-- `POST /api/identities/:id/merge`
-- `DELETE /api/identities/:id`
-- `POST /api/identities/:id/snapshot`
-- `POST /api/identities/:id/mute`
-- `POST /webrtc/offer`
+## Backend environment (optional)
+- `AICAM_ENABLE_FRAME_STREAMING=1` enables Python frame endpoints (`/api/media/ws`, `/api/media/mjpeg`).
+- Default is disabled to avoid server-side frame encode overhead.
 
-### WebSocket
-- `ws://<host>/ws/metadata` in dev
-- `wss://<host>/ws/metadata` in production
+## Janus live-view integration sample
+Use this pattern in `src/pages/LiveView.jsx` / `src/components/VideoCanvas.tsx`:
 
-Message shape:
-```json
-{
-  "frame_id": 12345,
-  "timestamp": "2026-02-22T14:01:10Z",
-  "tracks": [
-    {
-      "track_id": 17,
-      "bbox": [x, y, w, h],
-      "identity_id": 3,
-      "label": "ID:3 (0.82)",
-      "modality": "face",
-      "thumb": "/faces/3_last.jpg"
-    }
-  ]
+```js
+const janusServer = "http://localhost:8088/janus";
+const mountpointId = 1;
+
+async function janusPost(path, body) {
+  const response = await fetch(`${janusServer}${path}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...body, transaction: Math.random().toString(36).slice(2, 10) })
+  });
+  if (!response.ok) throw new Error(`Janus HTTP ${response.status}`);
+  return await response.json();
+}
+
+async function startJanus(videoEl) {
+  const create = await janusPost("", { janus: "create" });
+  const sessionId = create.data.id;
+  const attach = await janusPost(`/${sessionId}`, {
+    janus: "attach",
+    plugin: "janus.plugin.streaming"
+  });
+  const handleId = attach.data.id;
+
+  const pc = new RTCPeerConnection();
+  pc.ontrack = (ev) => {
+    videoEl.srcObject = ev.streams[0];
+    videoEl.play();
+  };
+  pc.onicecandidate = (ev) => {
+    janusPost(`/${sessionId}/${handleId}`, {
+      janus: "trickle",
+      candidate: ev.candidate ?? { completed: true }
+    }).catch(() => {});
+  };
+
+  await janusPost(`/${sessionId}/${handleId}`, {
+    janus: "message",
+    body: { request: "watch", id: mountpointId }
+  });
+
+  // Poll Janus events, apply remote offer, create answer, then send "start".
 }
 ```
 
-## WebRTC notes
-`/webrtc/offer` in the mock server is a signaling stub for local UI plumbing only. A real backend must:
-1. accept SDP offers
-2. generate valid SDP answers
-3. attach a media source to `RTCPeerConnection`
+## API endpoints
+- `GET /api/health` -> `{"status":"ok","time":"..."}`
+- `GET /api/identities` -> identity list JSON
+- `GET /api/realtime/latest` -> latest metadata payload
+- `WS /api/realtime/ws` -> metadata stream
 
-If WebRTC fails, the UI falls back to `/stream.mjpeg` automatically.
+## Verification checklist
+- Janus container is healthy: `docker compose ps janus`
+- Janus player test works: open `janus/test-player.html` and see live video.
+- Frontend Live page shows `Video: JANUS`.
+- Boxes and IDs render in overlay from metadata WS.
+- `curl http://127.0.0.1:8080/api/health` returns status JSON.
+- `curl http://127.0.0.1:8080/api/identities` returns JSON list.
+- Stop Janus: frontend should fail over to fallback transport instead of crashing.
 
-## Why canvas overlays preserve quality
-The `<video>` element displays the raw stream directly. Overlay annotations are drawn on a separate `<canvas>` layered above it. This avoids server-side re-encoding and keeps stream pixels unchanged while maintaining low-latency visual metadata.
-
-## Pixel-perfect mode
-LiveView includes a `Pixel-perfect` toggle. When enabled, the canvas backing store uses video resolution x DPR for sharper overlays on high-DPI displays.
-
-## Large library scaling
-For large identity sets, integrate virtualization (for example `@tanstack/react-virtual`) in `Library.tsx` grid rendering. The current implementation keeps lazy-loaded images and cheap card rendering as a baseline.
-
-## Environment overrides
-Optional env vars:
-- `VITE_API_BASE` (default `http://localhost:8080`)
-- `VITE_WS_METADATA_URL` (default `ws://localhost:8080/ws/metadata`)
-- `VITE_WEBRTC_OFFER` (default `${VITE_API_BASE}/webrtc/offer`)
-- `VITE_DISABLE_WEBRTC=true` (force MJPEG fallback)
-- `VITE_USE_MOCK=1` (enable mock proxy mode in dev config)
-
-Legacy compatibility:
-- `REACT_APP_API_URL`
-- `REACT_APP_WS_URL`
-- `REACT_APP_WEBRTC_OFFER`
-- `REACT_APP_MJPEG`
-- `REACT_APP_USE_MOCK`
-
-## Integration checklist for real backend
-1. Implement `/webrtc/offer` with full signaling/media.
-2. Emit metadata frames on `/ws/metadata` using the documented contract.
-3. Expose identity REST endpoints.
-4. Keep video raw; do not burn overlays server-side.
+## Debug checklist
+- No Janus video: verify `VITE_JANUS_HTTP_URL` and `VITE_JANUS_MOUNTPOINT`.
+- No overlay: verify metadata WS at `/api/realtime/ws`.
+- High backend CPU: ensure `AICAM_ENABLE_FRAME_STREAMING` is not enabled.
+- Camera pull issues in Janus: use `scripts/ffmpeg-push.sh` with `-c copy` and ingest via your gateway path.

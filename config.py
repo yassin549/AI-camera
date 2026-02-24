@@ -12,10 +12,15 @@ APP_VERSION = "0.1"
 PROJECT_ROOT = Path(__file__).resolve().parent
 STATIC_PATH = Path(os.getenv("AICAM_STATIC_PATH", str(PROJECT_ROOT))).resolve()
 
-# Keep MJPEG conservative by default to reduce API CPU overhead.
-MJPEG_FPS = max(1.0, float(os.getenv("AICAM_MJPEG_FPS", "12")))
+# Match camera FPS for smooth streaming; override with AICAM_MJPEG_FPS env var.
+MJPEG_FPS = max(1.0, float(os.getenv("AICAM_MJPEG_FPS", "30")))
 MJPEG_JPEG_QUALITY = int(os.getenv("AICAM_MJPEG_QUALITY", "80"))
 MJPEG_MAX_CLIENTS = max(1, int(os.getenv("AICAM_MJPEG_MAX_CLIENTS", "8")))
+ENABLE_FRAME_STREAMING = os.getenv("AICAM_ENABLE_FRAME_STREAMING", "0").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+}
 
 _cors_from_env = os.getenv("CORS_ORIGINS", "").strip()
 if _cors_from_env:

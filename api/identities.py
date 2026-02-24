@@ -106,28 +106,32 @@ def _format_iso(value: Optional[str]) -> str:
 def _path_to_media_url(raw_path: Optional[str], media_root: Path) -> Optional[str]:
     if not raw_path:
         return None
-    media_root = media_root.resolve()
     path = Path(str(raw_path))
     candidates: List[Path] = []
-
     if path.is_absolute():
-        candidates.append(path)
+        try:
+            candidates.append(path.relative_to(media_root))
+        except Exception:
+            candidates = []
     else:
-        candidates.append((media_root / path).resolve())
-        candidates.append((Path.cwd() / path).resolve())
-
+        candidates.append(Path(str(path).replace("\\", "/").lstrip("/")))
     basename = path.name
     if basename:
         for subdir in ("faces", "body", "bodies", "samples/faces", "samples/bodies", "data/faces", "data/bodies"):
-            candidates.append((media_root / subdir / basename).resolve())
+            candidates.append(Path(subdir) / basename)
 
+    seen: Set[str] = set()
     for candidate in candidates:
+        key = candidate.as_posix()
+        if key in seen:
+            continue
+        seen.add(key)
+        abs_candidate = media_root / candidate
         try:
-            rel = candidate.resolve().relative_to(media_root)
+            if abs_candidate.exists() and abs_candidate.is_file():
+                return f"/media/{key}"
         except Exception:
             continue
-        if candidate.exists():
-            return f"/media/{rel.as_posix()}"
     return None
 
 
@@ -137,14 +141,16 @@ def _path_candidates(raw_path: Optional[str], media_root: Path) -> Iterable[Path
     path = Path(str(raw_path))
     out: List[Path] = []
     if path.is_absolute():
-        out.append(path)
+        try:
+            out.append(media_root / path.relative_to(media_root))
+        except Exception:
+            pass
     else:
-        out.append((media_root / path).resolve())
-        out.append((Path.cwd() / path).resolve())
+        out.append(media_root / Path(str(path).replace("\\", "/").lstrip("/")))
     basename = path.name
     if basename:
         for subdir in ("faces", "body", "bodies", "samples/faces", "samples/bodies", "data/faces", "data/bodies"):
-            out.append((media_root / subdir / basename).resolve())
+            out.append(media_root / subdir / basename)
     return out
 
 
@@ -161,7 +167,10 @@ def _discover_samples_from_filesystem(identity_id: int, media_root: Path) -> Tup
         media_root / "data" / "bodies",
         media_root / "samples" / "bodies",
     ]
-    patterns = [f"{identity_id}_*.jpg", f"{identity_id}_*.jpeg", f"{identity_id}_*.png"]
+    patterns = [
+        f"{identity_id}_*.jpg", f"{identity_id}_*.jpeg", f"{identity_id}_*.png",
+        f"face_*_t{identity_id}.jpg", f"face_*_t{identity_id}.jpeg",
+    ]
 
     def gather(paths: List[Path]) -> List[str]:
         out: List[str] = []
@@ -171,7 +180,7 @@ def _discover_samples_from_filesystem(identity_id: int, media_root: Path) -> Tup
             for pattern in patterns:
                 for candidate in sorted(directory.glob(pattern)):
                     try:
-                        rel = candidate.resolve().relative_to(media_root.resolve())
+                        rel = candidate.relative_to(media_root)
                     except Exception:
                         continue
                     out.append(f"/media/{rel.as_posix()}")
@@ -318,19 +327,11 @@ def _row_to_payload(
 def _remove_samples(paths: Sequence[Optional[str]], media_root: Path) -> None:
     for raw_path in paths:
         for candidate in _path_candidates(raw_path, media_root):
-            try:
-                resolved = candidate.resolve()
-            except Exception:
-                continue
-            try:
-                resolved.relative_to(media_root.resolve())
-            except Exception:
-                continue
-            if resolved.exists():
+            if candidate.exists():
                 try:
-                    resolved.unlink()
+                    candidate.unlink()
                 except Exception:
-                    LOGGER.warning("Failed to delete sample file: %s", resolved, exc_info=True)
+                    LOGGER.warning("Failed to delete sample file: %s", candidate, exc_info=True)
 
 
 def _guess_identity_id_from_path(path: Path) -> Optional[int]:
@@ -339,10 +340,13 @@ def _guess_identity_id_from_path(path: Path) -> Optional[int]:
         r"^(\d+)_",
         r"^identity[_-]?(\d+)",
         r"^id[_-]?(\d+)",
+        r".*[_-]identity[_-]?(\d+)$",
+        r".*[_-]id[_-]?(\d+)$",
+        r".*[_-]t(\d+)$",
         r".*[_-](\d+)$",
     ]
     for pattern in patterns:
-        match = re.match(pattern, name)
+        match = re.search(pattern, name)
         if match:
             try:
                 return int(match.group(1))
@@ -372,7 +376,7 @@ def _upsert_identity_sample(
 
 
 def run_reindex(runtime: Any) -> Dict[str, int]:
-    media_root = runtime.media_root.resolve()
+    media_root = Path(runtime.media_root)
     face_dirs = [
         media_root / "faces",
         media_root / "data" / "faces",
@@ -415,7 +419,11 @@ def run_reindex(runtime: Any) -> Dict[str, int]:
                     if identity_id is None or identity_id not in identity_ids:
                         report["orphans"] += 1
                         continue
-                    rel_path = file_path.resolve().relative_to(media_root).as_posix()
+                    try:
+                        rel_path = file_path.relative_to(media_root).as_posix()
+                    except Exception:
+                        report["orphans"] += 1
+                        continue
                     inserted = _upsert_identity_sample(conn, identity_id, rel_path, sample_type)
                     if inserted:
                         report["added"] += 1

@@ -28,6 +28,9 @@ function asBool(value: string | undefined): boolean {
 const restBase = readEnv("VITE_API_BASE", "REACT_APP_API_URL") ?? "http://localhost:8080";
 const wsMetadata = readEnv("VITE_WS_METADATA_URL", "REACT_APP_WS_URL") ?? "ws://localhost:8080/ws/metadata";
 const webrtcOffer = readEnv("VITE_WEBRTC_OFFER", "REACT_APP_WEBRTC_OFFER");
+const janusHttp = readEnv("VITE_JANUS_HTTP_URL", "REACT_APP_JANUS_HTTP_URL") ?? "http://localhost:8088/janus";
+const janusMountpoint = Number(readEnv("VITE_JANUS_MOUNTPOINT", "REACT_APP_JANUS_MOUNTPOINT") ?? "1");
+const videoWs = readEnv("VITE_VIDEO_WS_URL", "REACT_APP_VIDEO_WS_URL") ?? "/api/media/ws";
 const mjpegFallback = readEnv("VITE_MJPEG", "REACT_APP_MJPEG") ?? "/stream.mjpeg";
 const useMock = asBool(readEnv("VITE_USE_MOCK", "REACT_APP_USE_MOCK"));
 
@@ -40,6 +43,9 @@ export const API = {
   WS_METADATA: wsMetadata,
   WEBRTC_OFFER:
     webrtcOffer ?? `${trimTrailingSlash(restBase || "http://localhost:8080")}/webrtc/offer`,
+  JANUS_HTTP: janusHttp,
+  JANUS_MOUNTPOINT: Number.isFinite(janusMountpoint) && janusMountpoint > 0 ? janusMountpoint : 1,
+  VIDEO_WS: videoWs,
   MJPEG_FALLBACK: mjpegFallback,
   USE_MOCK: useMock || false
 };
