@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 import onnxruntime as ort
 
-from embedder_body import body_descriptor_from_backbone
+from embedder_body import MobileNetBodyFallback, body_descriptor_from_backbone
 from utils import iou
 
 LOGGER = logging.getLogger(__name__)
@@ -36,6 +36,7 @@ class YOLOv8ONNXDetector:
         iou_threshold: float = 0.50,
         feature_output_name: Optional[str] = None,
         disable_body_embedding: bool = True,
+        body_fallback_model_path: Optional[str] = None,
     ) -> None:
         self.model_path = str(model_path)
         self.capture_size = (int(imgsz[0]), int(imgsz[1]))
@@ -63,6 +64,7 @@ class YOLOv8ONNXDetector:
         self.model_input_size = self._resolve_model_input_size(self.input_shape, self.capture_size)
 
         self.feature_output_name: Optional[str] = None
+        self.body_fallback: Optional[MobileNetBodyFallback] = None
         if not self.disable_body_embedding:
             if feature_output_name and feature_output_name in self.output_names:
                 self.feature_output_name = feature_output_name
@@ -71,6 +73,8 @@ class YOLOv8ONNXDetector:
                     if len(out.shape) == 4:
                         self.feature_output_name = out.name
                         break
+            if self.feature_output_name is None:
+                self.body_fallback = MobileNetBodyFallback(model_path=body_fallback_model_path)
 
         LOGGER.info(
             "Detector input canvas: %sx%s | capture frame: %sx%s",
@@ -81,7 +85,7 @@ class YOLOv8ONNXDetector:
         )
         LOGGER.info(
             "Body embedding mode: %s",
-            "yolo_backbone" if self.feature_output_name else "disabled",
+            "yolo_backbone" if self.feature_output_name else ("crop_fallback" if self.body_fallback else "disabled"),
         )
 
     @staticmethod
@@ -117,6 +121,11 @@ class YOLOv8ONNXDetector:
                     model_input_size=self.model_input_size,
                     target_dim=256,
                 )
+        elif not self.disable_body_embedding and self.body_fallback is not None:
+            for det in detections:
+                x1, y1, x2, y2 = [int(v) for v in det.bbox]
+                crop = frame_bgr[max(0, y1):max(y1 + 1, y2), max(0, x1):max(x1 + 1, x2)]
+                det.feature = self.body_fallback.embed(crop)
 
         return detections
 

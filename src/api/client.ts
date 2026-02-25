@@ -41,12 +41,16 @@ export interface TrackPayload {
   identity_id: number | null;
   label: string;
   modality: "face" | "body" | "none" | string;
+  age_ratio?: number;
+  age_frames?: number;
   thumb?: string;
 }
 
 export interface MetadataPayload {
   frame_id: number;
   timestamp: string;
+  source_width: number;
+  source_height: number;
   tracks: TrackPayload[];
 }
 
@@ -71,10 +75,54 @@ function joinUrl(base: string, path: string): string {
   return `${cleanBase}${cleanPath}`;
 }
 
+function getApiKey(): string | null {
+  if (!API.API_KEY) {
+    return null;
+  }
+  const normalized = String(API.API_KEY).trim();
+  return normalized.length > 0 ? normalized : null;
+}
+
+function appendQueryParam(url: string, key: string, value: string): string {
+  try {
+    const parsed = new URL(url);
+    if (!parsed.searchParams.has(key)) {
+      parsed.searchParams.set(key, value);
+    }
+    return parsed.toString();
+  } catch {
+    const [base, hash = ""] = url.split("#", 2);
+    const hasQuery = new RegExp(`(?:\\?|&)${key}=`).test(base);
+    if (hasQuery) {
+      return url;
+    }
+    const separator = base.includes("?") ? "&" : "?";
+    const next = `${base}${separator}${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+    return hash ? `${next}#${hash}` : next;
+  }
+}
+
+export function withApiKeyQuery(url: string): string {
+  const key = getApiKey();
+  if (!key || !url) {
+    return url;
+  }
+  return appendQueryParam(url, "api_key", key);
+}
+
+export function withApiKeyHeaders(input?: HeadersInit): Headers {
+  const headers = new Headers(input ?? {});
+  const key = getApiKey();
+  if (key && !headers.has("x-api-key")) {
+    headers.set("x-api-key", key);
+  }
+  return headers;
+}
+
 function toWsUrl(input: string): string {
   if (!input) {
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${window.location.host}/ws/metadata`;
+    return `${protocol}//${window.location.host}/api/realtime/ws`;
   }
   if (/^wss?:\/\//i.test(input)) {
     return input;
@@ -155,6 +203,14 @@ function normalizeIdentity(raw: unknown): IdentitySummary {
     ...coerceStringArray(source.body_sample_path),
     ...coerceStringArray(source.body_sample)
   ];
+  const sampleImages = [
+    ...coerceStringArray(source.sample_images),
+    ...coerceStringArray(source.sampleImages),
+    ...coerceStringArray(source.samples)
+  ];
+  if (faceSamples.length === 0 && bodySamples.length === 0 && sampleImages.length > 0) {
+    faceSamples.push(...sampleImages);
+  }
 
   const statsSource = (source.stats ?? {}) as Record<string, unknown>;
   const frequency = asNumber(statsSource.frequency ?? source.frequency ?? source.count ?? source.sightings);
@@ -219,7 +275,7 @@ function normalizeIdentityDetail(payload: unknown): IdentityDetailData {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const headers = new Headers(init?.headers ?? {});
+  const headers = withApiKeyHeaders(init?.headers);
   const hasBody = Boolean(init?.body);
   if (hasBody && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
@@ -287,11 +343,11 @@ export async function postWebRtcOffer(
   offer: WebRtcOfferPayload,
   path = API.WEBRTC_OFFER
 ): Promise<WebRtcAnswerPayload> {
+  const headers = withApiKeyHeaders();
+  headers.set("Content-Type", "application/json");
   const response = await fetch(joinUrl(API.REST_BASE, path), {
     method: "POST",
-    headers: {
-      "Content-Type": "application/json"
-    },
+    headers,
     body: JSON.stringify(offer)
   });
   if (!response.ok) {
@@ -356,5 +412,5 @@ export async function muteIdentity(id: string): Promise<{ ok: true }> {
 }
 
 export function resolveMetadataWsUrl(): string {
-  return toWsUrl(API.WS_METADATA);
+  return withApiKeyQuery(toWsUrl(API.WS_METADATA));
 }

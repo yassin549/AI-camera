@@ -10,7 +10,7 @@ interface LiveViewProps {
 
 export function LiveView({ active }: LiveViewProps): JSX.Element {
   const navigate = useNavigate();
-  const [pixelPerfect, setPixelPerfect] = useState(true);
+  const [pixelPerfect, setPixelPerfect] = useState(false);
   const [focusedTrack, setFocusedTrack] = useState<TrackPayload | null>(null);
   const [roster, setRoster] = useState<TrackPayload[]>([]);
   const [actionState, setActionState] = useState<string>("");

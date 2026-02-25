@@ -102,6 +102,7 @@ class TrackerAdapter:
         self.bytetrack = None
         self.fallback = None
         self._latest_tracks: List[Track] = []
+        self._last_detections: List[Track] = []
         self._last_update_ts = time.time()
 
         if sv is not None:
@@ -121,6 +122,13 @@ class TrackerAdapter:
     def update(self, detections: List[Track]) -> List[Track]:
         """Update tracker on detection frames."""
         self._last_update_ts = time.time()
+        if detections:
+            self._last_detections = [
+                Track(track_id=-1, bbox=tuple(det.bbox), score=float(det.score), feature=det.feature)
+                for det in detections
+            ]
+        else:
+            self._last_detections = []
         if self.bytetrack is not None:
             tracked = self._run_bytetrack(detections)
         else:
@@ -131,9 +139,32 @@ class TrackerAdapter:
         return list(self._latest_tracks)
 
     def predict(self) -> List[Track]:
-        """Advance tracker on non-detection frames."""
+        """Advance tracker on non-detection frames without starving tracker state."""
         if self.bytetrack is not None:
-            tracked = self._run_bytetrack([])
+            propagated: List[Track] = []
+            if self._latest_tracks:
+                propagated = [
+                    Track(
+                        track_id=int(tr.track_id),
+                        bbox=tuple(tr.bbox),
+                        score=max(0.05, float(tr.score) * 0.98),
+                        feature=tr.feature,
+                    )
+                    for tr in self._latest_tracks
+                ]
+            elif self._last_detections:
+                propagated = [
+                    Track(
+                        track_id=-1,
+                        bbox=tuple(det.bbox),
+                        score=max(0.05, float(det.score) * 0.96),
+                        feature=det.feature,
+                    )
+                    for det in self._last_detections
+                ]
+
+            # Only send an empty update when there is truly no scene evidence.
+            tracked = self._run_bytetrack(propagated if propagated else [])
         else:
             assert self.fallback is not None
             tracked = self.fallback.predict()

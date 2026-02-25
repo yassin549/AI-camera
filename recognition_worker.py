@@ -14,7 +14,16 @@ import numpy as np
 import db
 from embedder_face import FaceEmbedder
 from face_roi_detector import FaceROIDetector
-from utils import CounterFPS, FrameTimingStore, LatestFrameStore, SharedTrackStore, StageStats, ensure_dir, timestamp_iso
+from utils import (
+    CounterFPS,
+    FrameTimingStore,
+    LatestFrameStore,
+    RuntimeMetrics,
+    SharedTrackStore,
+    StageStats,
+    ensure_dir,
+    timestamp_iso,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -31,6 +40,7 @@ class RecognitionWorker:
         stage_stats: StageStats,
         fps_counter: CounterFPS,
         stop_event: threading.Event,
+        metrics: Optional[RuntimeMetrics] = None,
     ) -> None:
         self.frame_store = frame_store
         self.track_store = track_store
@@ -39,19 +49,30 @@ class RecognitionWorker:
         self.stage_stats = stage_stats
         self.fps_counter = fps_counter
         self.stop_event = stop_event
+        self.metrics = metrics
 
         self.face_detector = FaceROIDetector(min_confidence=float(cfg.get("face_roi_min_confidence", 0.5)))
         self.face_embedder = FaceEmbedder()
+        self.face_detector_available = bool(self.face_detector.available)
 
-        self.face_interval = int(cfg.get("face_interval_frames", 10))
+        self.face_interval = int(cfg.get("face_interval_frames", 4))
         self.body_interval = int(cfg.get("body_interval_frames", 10))
+        target_fps = max(1.0, float(cfg.get("target_fps", 30.0)))
+        self.face_interval_seconds = max(0.01, float(self.face_interval) / target_fps)
+        self.body_interval_seconds = max(0.01, float(self.body_interval) / target_fps)
         self.face_threshold = float(cfg.get("face_threshold", 0.60))
         self.body_threshold = float(cfg.get("body_threshold", 0.40))
         self.cache_seconds = float(cfg.get("cache_seconds", 30))
-        self.top_ratio = float(cfg.get("face_top_ratio", 0.50))
-        self.disable_body_embedding = bool(cfg.get("disable_body_embedding", True))
-        self.persist_body_only = bool(cfg.get("persist_body_only", False))
+        self.top_ratio = float(cfg.get("face_top_ratio", 0.68))
+        self.min_face_pixels = int(cfg.get("face_min_pixels", 40))
+        self.disable_body_embedding = bool(cfg.get("disable_body_embedding", False))
+        self.persist_body_only = bool(cfg.get("persist_body_only", True))
+        self.body_fallback_enabled = bool(cfg.get("body_fallback_enabled", True))
+        self.body_fallback_after_face_failures = int(cfg.get("body_fallback_after_face_failures", 3))
         self.faces_dir = ensure_dir(str(cfg.get("faces_dir", "./faces")))
+        self._face_failures: Dict[int, int] = {}
+        self._last_face_attempt_ts: Dict[int, float] = {}
+        self._last_body_attempt_ts: Dict[int, float] = {}
 
         self._thread: Optional[threading.Thread] = None
 
@@ -81,6 +102,12 @@ class RecognitionWorker:
             rec_ms_total = 0.0
             tracks = self.track_store.snapshot()
             now = time.time()
+            active_track_ids = {int(st.track_id) for st in tracks}
+            stale_failure_keys = [tid for tid in self._face_failures if tid not in active_track_ids]
+            for tid in stale_failure_keys:
+                self._face_failures.pop(tid, None)
+                self._last_face_attempt_ts.pop(tid, None)
+                self._last_body_attempt_ts.pop(tid, None)
 
             for st in tracks:
                 # Ignore stale tracks.
@@ -89,24 +116,51 @@ class RecognitionWorker:
 
                 # Cache gate for already-linked track IDs.
                 if st.identity_id is not None and now < float(st.cache_until):
+                    self._inc_metric("suppressed_by_cache", 1)
+                    LOGGER.info(
+                        "Recognition suppressed by cache | track_id=%s identity_id=%s cache_for=%.2fs",
+                        st.track_id,
+                        st.identity_id,
+                        float(st.cache_until) - now,
+                    )
                     continue
 
                 # Event-driven trigger: new track or unresolved track at rate limit.
                 should_try_face = bool(st.is_new) or st.identity_id is None
-                if should_try_face and (frame_id - int(st.last_face_frame) >= self.face_interval):
+                last_face_try_ts = float(self._last_face_attempt_ts.get(st.track_id, 0.0))
+                face_due_by_frame = frame_id - int(st.last_face_frame) >= self.face_interval
+                face_due_by_time = (now - last_face_try_ts) >= self.face_interval_seconds
+                if should_try_face and face_due_by_frame and face_due_by_time:
                     t0 = time.perf_counter()
                     self.track_store.mark_face_checked(st.track_id, frame_id)
+                    self._last_face_attempt_ts[st.track_id] = now
+                    self._inc_metric("recognition_attempts", 1)
+                    self._inc_metric("face_attempts", 1)
                     face_emb = self._extract_face_embedding(frame, st.bbox)
                     if face_emb is not None:
                         self._match_or_create_face(st.track_id, face_emb, frame, st.bbox, frame_id)
+                        self._face_failures[st.track_id] = 0
+                    else:
+                        self._face_failures[st.track_id] = int(self._face_failures.get(st.track_id, 0)) + 1
                     rec_ms_total += (time.perf_counter() - t0) * 1000.0
                     continue
 
                 # Optional body-only association path.
-                if not self.disable_body_embedding and st.feature is not None:
-                    if frame_id - int(st.last_body_frame) >= self.body_interval:
+                should_try_body_fallback = (
+                    self.body_fallback_enabled
+                    and not self.disable_body_embedding
+                    and st.feature is not None
+                    and int(self._face_failures.get(st.track_id, 0)) >= self.body_fallback_after_face_failures
+                )
+                if should_try_body_fallback:
+                    last_body_try_ts = float(self._last_body_attempt_ts.get(st.track_id, 0.0))
+                    body_due_by_frame = frame_id - int(st.last_body_frame) >= self.body_interval
+                    body_due_by_time = (now - last_body_try_ts) >= self.body_interval_seconds
+                    if body_due_by_frame and body_due_by_time:
                         t0 = time.perf_counter()
                         self.track_store.mark_body_checked(st.track_id, frame_id)
+                        self._last_body_attempt_ts[st.track_id] = now
+                        self._inc_metric("recognition_attempts", 1)
                         self._match_body(st.track_id, st.feature, frame_id)
                         rec_ms_total += (time.perf_counter() - t0) * 1000.0
 
@@ -127,28 +181,54 @@ class RecognitionWorker:
         y2 = max(y1 + 1, min(h, y2))
 
         top_h = max(1, int((y2 - y1) * self.top_ratio))
+        roi_w = max(1, x2 - x1)
         roi = frame_bgr[y1:y1 + top_h, x1:x2]
+        if roi_w < self.min_face_pixels or top_h < self.min_face_pixels:
+            LOGGER.debug(
+                "Face attempt skipped: roi_too_small | roi=%sx%s min=%s bbox=%s",
+                roi_w,
+                top_h,
+                self.min_face_pixels,
+                person_bbox,
+            )
+            return None
         if roi.size == 0:
+            LOGGER.debug("Face attempt skipped: empty_roi | bbox=%s", person_bbox)
             return None
 
         roi_rgb = cv2.cvtColor(roi, cv2.COLOR_BGR2RGB)
         faces = self.face_detector.detect(roi_rgb)
         if not faces:
+            LOGGER.debug("Face attempt skipped: no_face_detected | bbox=%s", person_bbox)
             return None
 
+        self._inc_metric("face_detections", 1)
         fx1, fy1, fx2, fy2, _score = max(faces, key=lambda v: v[4])
         ax1 = max(0, x1 + int(fx1))
         ay1 = max(0, y1 + int(fy1))
         ax2 = min(w, x1 + int(fx2))
         ay2 = min(h, y1 + int(fy2))
         if ax2 <= ax1 or ay2 <= ay1:
+            LOGGER.debug("Face attempt skipped: invalid_face_box | face_box=%s", (ax1, ay1, ax2, ay2))
             return None
 
         face_crop = frame_bgr[ay1:ay2, ax1:ax2]
         if face_crop.size == 0:
+            LOGGER.debug("Face attempt skipped: empty_face_crop | face_box=%s", (ax1, ay1, ax2, ay2))
+            return None
+        if (ax2 - ax1) < self.min_face_pixels or (ay2 - ay1) < self.min_face_pixels:
+            LOGGER.debug(
+                "Face attempt skipped: face_crop_too_small | face=%sx%s min=%s",
+                ax2 - ax1,
+                ay2 - ay1,
+                self.min_face_pixels,
+            )
             return None
 
-        return self.face_embedder.embed_from_bgr(face_crop)
+        emb = self.face_embedder.embed_from_bgr(face_crop)
+        if emb is not None:
+            self._inc_metric("embedding_success", 1)
+        return emb
 
     def _match_or_create_face(
         self,
@@ -163,6 +243,7 @@ class RecognitionWorker:
         best_id, best_score = db.find_best_face(face_emb)
         if best_id is not None and best_score >= self.face_threshold:
             db.update_last_seen(int(best_id), now_ts)
+            self._inc_metric("successful_matches", 1)
             self.track_store.assign_identity(
                 track_id=track_id,
                 identity_id=int(best_id),
@@ -183,6 +264,8 @@ class RecognitionWorker:
 
         # Create identity first so we can use the ID in the filename.
         new_id = db.add_identity(face_emb, None, None, None, now_ts)
+        self._inc_metric("db_inserts", 1)
+        self._inc_metric("db_writes", 1)
 
         # Save the face sample with identity ID in the filename so that
         # _discover_face_thumb() can find it via the <id>_*.jpg glob pattern.
@@ -193,6 +276,7 @@ class RecognitionWorker:
             cv2.imwrite(sample_path, sample)
             # Update the DB row with the sample path.
             db.update_face_sample_path(int(new_id), sample_path)
+            self._inc_metric("db_writes", 1)
 
         self.track_store.assign_identity(
             track_id=track_id,
@@ -209,6 +293,8 @@ class RecognitionWorker:
         if best_id is not None and best_score >= self.body_threshold:
             db.update_last_seen(int(best_id), now_ts)
             db.update_body_ema(int(best_id), body_emb)
+            self._inc_metric("successful_matches", 1)
+            self._inc_metric("db_writes", 2)
             self.track_store.assign_identity(
                 track_id=track_id,
                 identity_id=int(best_id),
@@ -221,6 +307,8 @@ class RecognitionWorker:
 
         if self.persist_body_only:
             new_id = db.add_identity(None, body_emb, None, None, now_ts)
+            self._inc_metric("db_inserts", 1)
+            self._inc_metric("db_writes", 1)
             self.track_store.assign_identity(
                 track_id=track_id,
                 identity_id=int(new_id),
@@ -229,3 +317,7 @@ class RecognitionWorker:
                 frame_id=frame_id,
                 cache_seconds=self.cache_seconds,
             )
+
+    def _inc_metric(self, name: str, amount: int = 1) -> None:
+        if self.metrics is not None:
+            self.metrics.inc(name, amount)

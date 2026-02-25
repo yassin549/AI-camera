@@ -29,6 +29,7 @@ from config import (
     MJPEG_JPEG_QUALITY,
     STATIC_PATH,
 )
+from utils import RuntimeMetrics
 
 LOGGER = logging.getLogger("aicam.api")
 
@@ -104,30 +105,54 @@ class MetadataHub:
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
         self._version = 0
         self._latest: Optional[Dict[str, Any]] = None
 
     def publish(self, payload: Dict[str, Any]) -> None:
-        with self._lock:
+        with self._cond:
             self._version += 1
             self._latest = payload
+            self._cond.notify_all()
 
     def snapshot(self) -> Tuple[int, Optional[Dict[str, Any]]]:
         with self._lock:
             return self._version, dict(self._latest) if self._latest is not None else None
 
+    def wait_for_update(self, last_version: int, timeout: float) -> Tuple[int, Optional[Dict[str, Any]], bool]:
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        with self._cond:
+            while self._version <= int(last_version):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    payload = dict(self._latest) if self._latest is not None else None
+                    return self._version, payload, False
+                self._cond.wait(timeout=remaining)
+            payload = dict(self._latest) if self._latest is not None else None
+            return self._version, payload, True
+
 
 class ApiRuntimeState:
     """Shared state consumed by API routes and updated from pipeline threads."""
 
-    def __init__(self, frame_store: Any, db_path: str, media_root: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        frame_store: Any,
+        db_path: str,
+        media_root: Optional[str] = None,
+        metrics: Optional[RuntimeMetrics] = None,
+        capabilities: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.frame_store = frame_store
         self.db_path = str(db_path)
         self.media_root = Path(media_root or STATIC_PATH)
         self.enable_frame_streaming = bool(ENABLE_FRAME_STREAMING)
+        self.metrics = metrics
 
         self._tracks_lock = threading.RLock()
         self._tracks: Dict[int, Dict[str, Any]] = {}
+        self._capabilities_lock = threading.Lock()
+        self._capabilities: Dict[str, Any] = dict(capabilities or {})
 
         self._thumb_lock = threading.Lock()
         self._thumb_cache: Dict[int, str] = {}
@@ -149,6 +174,14 @@ class ApiRuntimeState:
         self._placeholder_jpeg = self._build_placeholder_jpeg()
 
         self.metadata_hub = MetadataHub()
+
+    def set_capability(self, name: str, value: Any) -> None:
+        with self._capabilities_lock:
+            self._capabilities[str(name)] = value
+
+    def get_capabilities(self) -> Dict[str, Any]:
+        with self._capabilities_lock:
+            return dict(self._capabilities)
 
     def register_peer_connection(self, peer_connection: Any) -> None:
         with self._peer_lock:
@@ -217,11 +250,11 @@ class ApiRuntimeState:
             return b""
         return encoded.tobytes()
 
-    def update_frame(self, frame: np.ndarray, frame_id: int) -> None:
+    def update_frame(self, frame: np.ndarray, frame_id: int, frame_ts: Optional[float] = None) -> None:
         with self._frame_lock:
             self._latest_frame = frame
             self._latest_frame_id = int(frame_id)
-            self._latest_frame_ts = time.time()
+            self._latest_frame_ts = float(frame_ts) if frame_ts is not None else time.time()
 
     def get_latest_jpeg_packet(self) -> Tuple[int, bytes]:
         if not self.enable_frame_streaming:
@@ -273,11 +306,16 @@ class ApiRuntimeState:
         tracks_payload: Dict[int, Dict[str, Any]],
         frame_id: int,
         frame_shape: Tuple[int, int, int],
+        frame: Optional[np.ndarray] = None,
+        frame_ts: Optional[float] = None,
     ) -> None:
         if self.enable_frame_streaming:
-            packet = self.frame_store.get_latest()
-            if packet is not None:
-                self.update_frame(packet.frame, int(packet.frame_id))
+            if frame is not None:
+                self.update_frame(frame=frame, frame_id=int(frame_id), frame_ts=frame_ts)
+            else:
+                packet = self.frame_store.get_latest()
+                if packet is not None:
+                    self.update_frame(packet.frame, int(packet.frame_id), frame_ts=float(packet.ts))
         with self._tracks_lock:
             self._tracks = {int(k): dict(v) for k, v in tracks_payload.items()}
         try:
@@ -317,7 +355,7 @@ class ApiRuntimeState:
             except Exception:
                 LOGGER.debug("Thumb cache refresh failed", exc_info=True)
             self._thumb_cache = next_cache
-            self._thumb_cache_expire_at = now + 1.0
+            self._thumb_cache_expire_at = now + 5.0
 
     def _build_metadata_payload(
         self,
@@ -336,14 +374,14 @@ class ApiRuntimeState:
             modality = str(track.get("modality", "none"))
             score = float(track.get("last_score", 0.0))
             confidence = float(track.get("score", score))
+            age_ratio = float(track.get("age_ratio", 0.0))
+            age_frames = int(track.get("age_frames", 0))
 
             bbox_raw = track.get("bbox", [0, 0, 0, 0])
             try:
                 x1, y1, x2, y2 = [int(v) for v in bbox_raw]
             except Exception:
                 x1, y1, x2, y2 = (0, 0, 0, 0)
-            w = max(0, x2 - x1)
-            h = max(0, y2 - y1)
 
             if identity_id is None:
                 label = f"Track {track_id}"
@@ -356,11 +394,13 @@ class ApiRuntimeState:
             out_tracks.append(
                 {
                     "track_id": track_id,
-                    "bbox": [x1, y1, w, h],
+                    "bbox": [x1, y1, x2, y2],
                     "identity_id": None if identity_id is None else int(identity_id),
                     "label": label,
                     "modality": modality,
                     "confidence": confidence,
+                    "age_ratio": age_ratio,
+                    "age_frames": age_frames,
                     "thumb": thumb,
                 }
             )
@@ -410,8 +450,6 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
                 "/api/identities/{id}",
                 "/api/realtime/ws",
                 "/webrtc/offer",
-                "/api/media/mjpeg",
-                "/api/media/ws",
             ],
         }
         if not AIORTC_AVAILABLE:
@@ -420,7 +458,17 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
 
     @app.get("/api/health")
     def api_health() -> Dict[str, Any]:
-        return {"status": "ok", "time": _utc_now_iso()}
+        payload: Dict[str, Any] = {
+            "status": "ok",
+            "time": _utc_now_iso(),
+            "capture_running": runtime.is_capture_running(),
+        }
+        payload.update(runtime.get_capabilities())
+        return payload
+
+    @app.get("/health")
+    def health() -> Dict[str, Any]:
+        return api_health()
 
     @app.get("/healthz")
     def healthz() -> Dict[str, Any]:
@@ -462,7 +510,16 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
             "ws_clients": ws_clients,
             "identities_count": identities_count,
             "frame_streaming_enabled": runtime.enable_frame_streaming,
+            **runtime.get_capabilities(),
         }
+
+    @app.get("/metrics")
+    def metrics() -> Dict[str, Any]:
+        if runtime.metrics is None:
+            return {"counters": {}, "gauges": {}, "capabilities": runtime.get_capabilities()}
+        snapshot = runtime.metrics.snapshot()
+        snapshot["capabilities"] = runtime.get_capabilities()
+        return snapshot
 
     @app.on_event("startup")
     async def _on_startup() -> None:

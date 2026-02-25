@@ -22,7 +22,8 @@ def mount_static_media(app: FastAPI, media_root: str) -> None:
 
 
 def _ensure_authorized(request: Request) -> None:
-    if not is_api_key_valid(request.headers.get("x-api-key")):
+    candidate = request.headers.get("x-api-key") or request.query_params.get("api_key")
+    if not is_api_key_valid(candidate):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid API key")
 
 

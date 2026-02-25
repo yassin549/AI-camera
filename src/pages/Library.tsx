@@ -129,7 +129,8 @@ export function Library({ initialIdentities }: LibraryProps): JSX.Element {
 
         <motion.div
           layout
-          className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-4"
+          className="mt-6 grid justify-center gap-4"
+          style={{ gridTemplateColumns: "repeat(auto-fit, minmax(11.5rem, 11.5rem))" }}
           initial={false}
         >
           {filtered.map((identity) => {

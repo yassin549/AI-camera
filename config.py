@@ -16,7 +16,7 @@ STATIC_PATH = Path(os.getenv("AICAM_STATIC_PATH", str(PROJECT_ROOT))).resolve()
 MJPEG_FPS = max(1.0, float(os.getenv("AICAM_MJPEG_FPS", "30")))
 MJPEG_JPEG_QUALITY = int(os.getenv("AICAM_MJPEG_QUALITY", "80"))
 MJPEG_MAX_CLIENTS = max(1, int(os.getenv("AICAM_MJPEG_MAX_CLIENTS", "8")))
-ENABLE_FRAME_STREAMING = os.getenv("AICAM_ENABLE_FRAME_STREAMING", "0").strip().lower() in {
+ENABLE_FRAME_STREAMING = os.getenv("AICAM_ENABLE_FRAME_STREAMING", "1").strip().lower() in {
     "1",
     "true",
     "yes",

@@ -105,7 +105,8 @@ def _normalize_offer(raw_body: bytes, content_type: str) -> WebRtcOfferBody:
 
 
 async def _ws_metadata_impl(websocket: WebSocket) -> None:
-    if not is_api_key_valid(websocket.headers.get("x-api-key")):
+    candidate = websocket.headers.get("x-api-key") or websocket.query_params.get("api_key")
+    if not is_api_key_valid(candidate):
         await websocket.close(code=4401, reason="Invalid API key")
         return
 
@@ -120,18 +121,24 @@ async def _ws_metadata_impl(websocket: WebSocket) -> None:
     client = websocket.client.host if websocket.client else "unknown"
     LOGGER.info("WS metadata connected from %s", client)
     last_version = 0
-    last_heartbeat_at = time.monotonic()
+    next_heartbeat_at = time.monotonic() + WS_HEARTBEAT_SEC
 
     await websocket.send_json({"type": "connected", "server_time": _utc_now_iso()})
 
     try:
         while True:
-            version, payload = runtime.metadata_hub.snapshot()
+            now = time.monotonic()
+            wait_timeout = max(0.001, min(0.2, next_heartbeat_at - now))
+            version, payload, _ = await asyncio.to_thread(
+                runtime.metadata_hub.wait_for_update,
+                last_version,
+                wait_timeout,
+            )
             if payload is not None and version > last_version:
                 await websocket.send_json(payload)
                 last_version = version
-                last_heartbeat_at = time.monotonic()
-            elif (time.monotonic() - last_heartbeat_at) >= WS_HEARTBEAT_SEC:
+                next_heartbeat_at = time.monotonic() + WS_HEARTBEAT_SEC
+            elif time.monotonic() >= next_heartbeat_at:
                 await websocket.send_json(
                     {
                         "type": "heartbeat",
@@ -139,10 +146,10 @@ async def _ws_metadata_impl(websocket: WebSocket) -> None:
                         "hint": "reconnect if stream remains idle",
                     }
                 )
-                last_heartbeat_at = time.monotonic()
+                next_heartbeat_at = time.monotonic() + WS_HEARTBEAT_SEC
 
             try:
-                message = await asyncio.wait_for(websocket.receive_text(), timeout=0.03)
+                message = await asyncio.wait_for(websocket.receive_text(), timeout=0.001)
                 if message.strip().lower() == "ping":
                     await websocket.send_json({"type": "pong", "server_time": _utc_now_iso()})
                 elif message.strip().lower() == "close":

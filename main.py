@@ -23,6 +23,7 @@ from utils import (
     CounterFPS,
     FrameTimingStore,
     LatestFrameStore,
+    RuntimeMetrics,
     SharedTrackStore,
     StageStats,
 )
@@ -47,19 +48,30 @@ def load_config(path: str) -> Dict[str, object]:
 
     # Runtime defaults.
     cfg.setdefault("imgsz", [640, 360])
-    cfg.setdefault("detection_interval", 3)
-    cfg.setdefault("face_interval_frames", 10)
+    cfg.setdefault("target_fps", 30.0)
+    cfg.setdefault("detection_interval", 1)
+    cfg.setdefault("detection_interval_max", 6)
+    cfg.setdefault("adaptive_detection_interval", True)
+    cfg.setdefault("face_interval_frames", 4)
     cfg.setdefault("body_interval_frames", 10)
     cfg.setdefault("face_threshold", 0.60)
     cfg.setdefault("body_threshold", 0.40)
     cfg.setdefault("cache_seconds", 30)
     cfg.setdefault("max_tracks", 20)
+    cfg.setdefault("max_track_age_frames", 24)
     cfg.setdefault("http_port", 8080)
     cfg.setdefault("http_host", "0.0.0.0")
-    cfg.setdefault("display_window", True)
+    cfg.setdefault("display_window", False)
     cfg.setdefault("debug", False)
     cfg.setdefault("debug_csv", "./debug/perf.csv")
-    cfg.setdefault("disable_body_embedding", True)
+    cfg.setdefault("disable_body_embedding", False)
+    cfg.setdefault("persist_body_only", True)
+    cfg.setdefault("body_fallback_enabled", True)
+    cfg.setdefault("body_fallback_after_face_failures", 3)
+    cfg.setdefault("body_fallback_model_path", "")
+    cfg.setdefault("face_top_ratio", 0.68)
+    cfg.setdefault("face_min_pixels", 40)
+    cfg.setdefault("face_roi_min_confidence", 0.50)
 
     # Model defaults.
     cfg.setdefault("yolo_onnx_path", "./models/yolov8n_person.onnx")
@@ -99,7 +111,7 @@ def _log_stage_window(
     fps_recognition: CounterFPS,
     fps_render: CounterFPS,
     window_sec: float,
-) -> None:
+) -> Dict[str, float]:
     d_cnt, d_avg, d_p95 = stage_stats.summary("detection_ms")
     t_cnt, t_avg, t_p95 = stage_stats.summary("tracking_ms")
     r_cnt, r_avg, r_p95 = stage_stats.summary("recognition_ms")
@@ -130,6 +142,12 @@ def _log_stage_window(
         r_cnt,
         v_cnt,
     )
+    return {
+        "det_fps": float(det_fps),
+        "trk_fps": float(trk_fps),
+        "rec_fps": float(rec_fps),
+        "rnd_fps": float(rnd_fps),
+    }
 
 
 def run_pipeline(
@@ -140,14 +158,39 @@ def run_pipeline(
     benchmark_seconds: int,
     display_window: bool,
 ) -> None:
+    imgsz = tuple(cfg.get("imgsz", [640, 360]))
+    detection_interval_cfg = max(1, int(cfg.get("detection_interval", 1)))
+    detection_interval_max = max(
+        detection_interval_cfg,
+        int(cfg.get("detection_interval_max", max(2, detection_interval_cfg))),
+    )
+    adaptive_detection_interval = bool(cfg.get("adaptive_detection_interval", True))
+    max_track_age_frames = max(1, int(cfg.get("max_track_age_frames", 24)))
+    target_fps = max(1.0, float(cfg.get("target_fps", 30.0)))
+    frame_budget_ms = 1000.0 / target_fps
+
+    LOGGER.info(
+        "Runtime config | detection_interval=%s adaptive_detection=%s detection_interval_max=%s "
+        "max_track_age_frames=%s face_attempt_interval=%s processing_resolution=%sx%s target_fps=%.1f",
+        detection_interval_cfg,
+        adaptive_detection_interval,
+        detection_interval_max,
+        max_track_age_frames,
+        int(cfg.get("face_interval_frames", 4)),
+        int(imgsz[0]),
+        int(imgsz[1]),
+        target_fps,
+    )
+
     db.configure(str(cfg.get("db_path", "./identities.db")), ephemeral=bool(cfg.get("ephemeral_mode", False)))
     db.init_db()
     db.load_all_embeddings()
 
     frame_store = LatestFrameStore()
-    track_store = SharedTrackStore()
+    track_store = SharedTrackStore(max_age_frames=max_track_age_frames)
     timing_store = FrameTimingStore()
     stage_stats = StageStats(window=4096)
+    metrics = RuntimeMetrics()
 
     fps_detection = CounterFPS()
     fps_tracking = CounterFPS()
@@ -156,8 +199,6 @@ def run_pipeline(
 
     stop_event = threading.Event()
 
-    imgsz = tuple(cfg.get("imgsz", [640, 360]))
-
     detector = YOLOv8ONNXDetector(
         model_path=str(cfg["yolo_onnx_path"]),
         imgsz=imgsz,
@@ -165,6 +206,7 @@ def run_pipeline(
         iou_threshold=float(cfg.get("person_iou_threshold", 0.50)),
         feature_output_name=cfg.get("yolo_feature_output_name"),
         disable_body_embedding=bool(cfg.get("disable_body_embedding", True)),
+        body_fallback_model_path=str(cfg.get("body_fallback_model_path", "")) or None,
     )
 
     tracker = TrackerAdapter(
@@ -180,11 +222,14 @@ def run_pipeline(
         stop_event=stop_event,
     )
 
-    detection_interval = max(1, int(cfg.get("detection_interval", 3)))
+    detection_interval = detection_interval_cfg
     max_tracks = int(cfg.get("max_tracks", 20))
+    metrics.set_gauge("detection_interval_current", float(detection_interval))
 
     def detection_loop() -> None:
+        nonlocal detection_interval
         last_frame_id = -1
+        next_detection_due_at = 0.0
         while not stop_event.is_set():
             packet = frame_store.wait_for_new(last_frame_id, timeout=0.1)
             if packet is None:
@@ -195,18 +240,37 @@ def run_pipeline(
             last_frame_id = frame_id
 
             tracks: List[Track]
-            if frame_id % detection_interval == 0:
+            now_mono = time.monotonic()
+            if now_mono >= next_detection_due_at:
                 t0 = time.perf_counter()
                 dets = detector.detect(frame)
                 det_ms = (time.perf_counter() - t0) * 1000.0
                 timing_store.set(frame_id, "detection_ms", det_ms)
                 stage_stats.add("detection_ms", det_ms)
                 fps_detection.inc(1)
+                metrics.inc("detector_frames", 1)
 
                 tr_in = [Track(track_id=-1, bbox=d.bbox, score=d.score, feature=d.feature) for d in dets]
                 t1 = time.perf_counter()
                 tracks = tracker.update(tr_in)
                 tr_ms = (time.perf_counter() - t1) * 1000.0
+
+                if adaptive_detection_interval:
+                    prev_interval = detection_interval
+                    if det_ms > (frame_budget_ms * 1.15) and detection_interval < detection_interval_max:
+                        detection_interval += 1
+                    elif det_ms < (frame_budget_ms * 0.65) and detection_interval > 1:
+                        detection_interval -= 1
+                    if detection_interval != prev_interval:
+                        LOGGER.info(
+                            "Adaptive detection interval adjusted %s -> %s (det_ms=%.2f budget_ms=%.2f)",
+                            prev_interval,
+                            detection_interval,
+                            det_ms,
+                            frame_budget_ms,
+                        )
+                next_detection_due_at = time.monotonic() + (max(1, detection_interval) / target_fps)
+                metrics.set_gauge("detection_interval_current", float(detection_interval))
             else:
                 timing_store.set(frame_id, "detection_ms", 0.0)
                 t1 = time.perf_counter()
@@ -216,13 +280,33 @@ def run_pipeline(
             timing_store.set(frame_id, "tracking_ms", tr_ms)
             stage_stats.add("tracking_ms", tr_ms)
             fps_tracking.inc(1)
+            metrics.inc("tracker_frames", 1)
 
-            track_store.update_from_tracker(tracks, frame_id=frame_id, max_tracks=max_tracks)
+            track_store.update_from_tracker(
+                tracks,
+                frame_id=frame_id,
+                max_tracks=max_tracks,
+                max_age_frames=max_track_age_frames,
+            )
+
+            track_payload = track_store.to_api_payload(current_frame_id=frame_id)
+            track_ages = [max(0, frame_id - int(t.get("last_seen_frame", frame_id))) for t in track_payload.values()]
+            metrics.set_gauge("active_tracks", float(len(track_payload)))
+            metrics.set_gauge("avg_track_age", float(sum(track_ages) / len(track_ages)) if track_ages else 0.0)
+            if start_api:
+                api_state.publish_tracks(
+                    track_payload,
+                    frame_id=frame_id,
+                    frame_shape=frame.shape,
+                    frame=frame,
+                    frame_ts=float(packet.ts),
+                )
 
     api_state = ApiRuntimeState(
         frame_store=frame_store,
         db_path=str(cfg.get("db_path", "./identities.db")),
         media_root=str(cfg.get("media_root", ".")),
+        metrics=metrics,
     )
     recognition = RecognitionWorker(
         frame_store=frame_store,
@@ -232,7 +316,13 @@ def run_pipeline(
         stage_stats=stage_stats,
         fps_counter=fps_recognition,
         stop_event=stop_event,
+        metrics=metrics,
     )
+    if not recognition.face_detector_available:
+        LOGGER.critical("Face detector unavailable at startup: mediapipe backend is missing")
+    api_state.set_capability("face_detector_available", bool(recognition.face_detector_available))
+    api_state.set_capability("adaptive_detection_interval", adaptive_detection_interval)
+    api_state.set_capability("processing_resolution", {"width": int(imgsz[0]), "height": int(imgsz[1])})
 
     capture.start()
     detection_thread = threading.Thread(target=detection_loop, daemon=True, name="det-track-worker")
@@ -266,6 +356,16 @@ def run_pipeline(
     started_at = time.time()
     next_log_at = started_at + 10.0
     last_rendered = -1
+    watched_metrics = [
+        "detector_frames",
+        "tracker_frames",
+        "face_attempts",
+        "face_detections",
+        "embedding_success",
+        "db_writes",
+    ]
+    metric_prev = metrics.counters()
+    metric_zero_since = {name: time.time() for name in watched_metrics}
 
     try:
         while not stop_event.is_set():
@@ -277,7 +377,7 @@ def run_pipeline(
 
             if packet is None:
                 if now >= next_log_at:
-                    _log_stage_window(
+                    stage = _log_stage_window(
                         stage_stats,
                         fps_detection,
                         fps_tracking,
@@ -285,24 +385,45 @@ def run_pipeline(
                         fps_render,
                         window_sec=10.0,
                     )
+                    curr = metrics.counters()
+                    window_delta = {k: int(curr.get(k, 0) - metric_prev.get(k, 0)) for k in watched_metrics}
+                    metric_prev = curr
+                    for name in watched_metrics:
+                        if window_delta.get(name, 0) <= 0:
+                            metric_zero_since[name] = metric_zero_since.get(name, now)
+                        else:
+                            metric_zero_since[name] = now
+                    zero_over = [n for n, ts in metric_zero_since.items() if (now - ts) >= 10.0]
+                    if zero_over:
+                        LOGGER.warning("metrics_zero_over_10s metrics=%s", ",".join(sorted(zero_over)))
+                    LOGGER.info(
+                        "runtime_metrics detector_fps=%.2f tracker_fps=%.2f detection_interval=%.0f active_tracks=%s avg_track_age=%.2f "
+                        "face_attempts=%s face_detections=%s embedding_success=%s db_writes=%s",
+                        stage["det_fps"],
+                        stage["trk_fps"],
+                        float(metrics.gauges().get("detection_interval_current", 1.0)),
+                        int(metrics.gauges().get("active_tracks", 0.0)),
+                        float(metrics.gauges().get("avg_track_age", 0.0)),
+                        int(window_delta.get("face_attempts", 0)),
+                        int(window_delta.get("face_detections", 0)),
+                        int(window_delta.get("embedding_success", 0)),
+                        int(window_delta.get("db_writes", 0)),
+                    )
                     next_log_at = now + 10.0
                 continue
 
             frame_id = int(packet.frame_id)
-            frame = packet.frame.copy()
             last_rendered = frame_id
 
             t0 = time.perf_counter()
-            track_states = track_store.snapshot()
-            _render_overlay(frame, track_states)
-
-            api_state.publish_tracks(
-                track_store.to_api_payload(),
-                frame_id=frame_id,
-                frame_shape=frame.shape,
-            )
+            frame = None
+            if display_window and not benchmark:
+                track_states = track_store.snapshot()
+                frame = packet.frame.copy()
+                _render_overlay(frame, track_states)
 
             if display_window and not benchmark:
+                assert frame is not None
                 cv2.imshow("AIcam", frame)
                 key = cv2.waitKey(1) & 0xFF
                 if key in (27, ord("q")):
@@ -326,13 +447,37 @@ def run_pipeline(
                 )
 
             if now >= next_log_at:
-                _log_stage_window(
+                stage = _log_stage_window(
                     stage_stats,
                     fps_detection,
                     fps_tracking,
                     fps_recognition,
                     fps_render,
                     window_sec=10.0,
+                )
+                curr = metrics.counters()
+                window_delta = {k: int(curr.get(k, 0) - metric_prev.get(k, 0)) for k in watched_metrics}
+                metric_prev = curr
+                for name in watched_metrics:
+                    if window_delta.get(name, 0) <= 0:
+                        metric_zero_since[name] = metric_zero_since.get(name, now)
+                    else:
+                        metric_zero_since[name] = now
+                zero_over = [n for n, ts in metric_zero_since.items() if (now - ts) >= 10.0]
+                if zero_over:
+                    LOGGER.warning("metrics_zero_over_10s metrics=%s", ",".join(sorted(zero_over)))
+                LOGGER.info(
+                    "runtime_metrics detector_fps=%.2f tracker_fps=%.2f detection_interval=%.0f active_tracks=%s avg_track_age=%.2f "
+                    "face_attempts=%s face_detections=%s embedding_success=%s db_writes=%s",
+                    stage["det_fps"],
+                    stage["trk_fps"],
+                    float(metrics.gauges().get("detection_interval_current", 1.0)),
+                    int(metrics.gauges().get("active_tracks", 0.0)),
+                    float(metrics.gauges().get("avg_track_age", 0.0)),
+                    int(window_delta.get("face_attempts", 0)),
+                    int(window_delta.get("face_detections", 0)),
+                    int(window_delta.get("embedding_success", 0)),
+                    int(window_delta.get("db_writes", 0)),
                 )
                 next_log_at = now + 10.0
                 timing_store.cleanup_older_than(frame_id - 600)

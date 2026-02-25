@@ -155,16 +155,22 @@ class TrackState:
 class SharedTrackStore:
     """Thread-safe shared track state table used by tracking/recognition/render."""
 
-    def __init__(self) -> None:
+    def __init__(self, max_age_frames: int = 24) -> None:
         self._lock = threading.RLock()
         self._tracks: Dict[int, TrackState] = {}
+        self.max_age_frames = max(1, int(max_age_frames))
 
-    def update_from_tracker(self, tracks: List[Any], frame_id: int, max_tracks: int = 20) -> None:
+    def update_from_tracker(
+        self,
+        tracks: List[Any],
+        frame_id: int,
+        max_tracks: int = 20,
+        max_age_frames: Optional[int] = None,
+    ) -> None:
+        effective_max_age = self.max_age_frames if max_age_frames is None else max(1, int(max_age_frames))
         with self._lock:
-            seen_ids = set()
             for tr in tracks[: max(1, int(max_tracks))]:
                 tid = int(tr.track_id)
-                seen_ids.add(tid)
                 if tid in self._tracks:
                     state = self._tracks[tid]
                     state.bbox = tuple(map(int, tr.bbox))
@@ -183,7 +189,7 @@ class SharedTrackStore:
                         is_new=True,
                     )
 
-            stale_cutoff = int(frame_id) - 90
+            stale_cutoff = int(frame_id) - effective_max_age
             stale = [tid for tid, st in self._tracks.items() if st.last_seen_frame < stale_cutoff]
             for tid in stale:
                 self._tracks.pop(tid, None)
@@ -229,10 +235,13 @@ class SharedTrackStore:
             if st is not None:
                 st.cache_until = float(cache_until_ts)
 
-    def to_api_payload(self) -> Dict[int, Dict[str, Any]]:
+    def to_api_payload(self, current_frame_id: Optional[int] = None) -> Dict[int, Dict[str, Any]]:
+        now_frame = None if current_frame_id is None else int(current_frame_id)
         with self._lock:
             payload: Dict[int, Dict[str, Any]] = {}
             for tid, st in self._tracks.items():
+                age_frames = 0 if now_frame is None else max(0, now_frame - int(st.last_seen_frame))
+                age_ratio = min(1.0, float(age_frames) / float(max(1, self.max_age_frames)))
                 payload[int(tid)] = {
                     "track_id": int(st.track_id),
                     "bbox": [int(v) for v in st.bbox],
@@ -241,6 +250,8 @@ class SharedTrackStore:
                     "modality": st.modality,
                     "last_score": float(st.identity_score),
                     "last_seen_frame": int(st.last_seen_frame),
+                    "age_frames": int(age_frames),
+                    "age_ratio": float(age_ratio),
                     "timestamp": timestamp_iso(),
                 }
             return payload
@@ -315,3 +326,53 @@ class CounterFPS:
     def value(self) -> int:
         with self._lock:
             return self._value
+
+
+class RuntimeMetrics:
+    """Thread-safe metrics registry for counters and gauges."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counters: Dict[str, int] = defaultdict(int)
+        self._gauges: Dict[str, float] = {}
+        self._last_nonzero_at: Dict[str, float] = defaultdict(time.time)
+
+    def inc(self, name: str, amount: int = 1) -> None:
+        key = str(name)
+        delta = int(amount)
+        with self._lock:
+            self._counters[key] += delta
+            if self._counters[key] > 0:
+                self._last_nonzero_at[key] = time.time()
+
+    def set_gauge(self, name: str, value: float) -> None:
+        key = str(name)
+        with self._lock:
+            self._gauges[key] = float(value)
+
+    def counters(self) -> Dict[str, int]:
+        with self._lock:
+            return dict(self._counters)
+
+    def gauges(self) -> Dict[str, float]:
+        with self._lock:
+            return dict(self._gauges)
+
+    def snapshot(self) -> Dict[str, Dict[str, float]]:
+        with self._lock:
+            return {
+                "counters": dict(self._counters),
+                "gauges": dict(self._gauges),
+            }
+
+    def zero_for_over(self, names: List[str], seconds: float) -> List[str]:
+        now = time.time()
+        out: List[str] = []
+        with self._lock:
+            for name in names:
+                key = str(name)
+                val = int(self._counters.get(key, 0))
+                last_nonzero = float(self._last_nonzero_at.get(key, now))
+                if val <= 0 and (now - last_nonzero) >= float(seconds):
+                    out.append(key)
+        return out

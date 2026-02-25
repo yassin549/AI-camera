@@ -18,7 +18,11 @@ export function PremiumSwitch({ value, onChange }: PremiumSwitchProps): JSX.Elem
     <RadioGroup value={value} onChange={onChange} aria-label="Choose between live and library views">
       <div className="inline-grid grid-cols-2 gap-1 rounded-xl bg-white/10 p-1 shadow-soft backdrop-blur-md">
         {OPTIONS.map((option) => (
-          <RadioGroup.Option key={option.value} value={option.value} className="relative outline-none">
+          <RadioGroup.Option
+            key={option.value}
+            value={option.value}
+            className="relative cursor-pointer outline-none"
+          >
             {({ checked, active }) => (
               <div
                 className={`relative rounded-lg px-4 py-2 text-sm font-medium transition-colors ${

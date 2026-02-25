@@ -16,7 +16,7 @@ interface UseRealtimeResult {
   latestRef: MutableRefObject<MetadataPayload | null>;
 }
 
-const RECONNECT_DELAYS_MS = [500, 1000, 2000, 4000, 8000];
+const RECONNECT_DELAYS_MS = [100, 250, 500, 1000, 2000];
 
 function coerceTrack(raw: unknown): TrackPayload | null {
   if (!raw || typeof raw !== "object") {
@@ -25,20 +25,25 @@ function coerceTrack(raw: unknown): TrackPayload | null {
   const source = raw as Partial<TrackPayload>;
   const fromBox = Array.isArray(source.bbox) ? source.bbox : null;
   const asRecord = source as Record<string, unknown>;
-  const fromCorners =
-    asRecord.x1 !== undefined &&
-    asRecord.y1 !== undefined &&
-    asRecord.x2 !== undefined &&
-    asRecord.y2 !== undefined
-      ? [asRecord.x1, asRecord.y1, asRecord.x2, asRecord.y2]
-      : null;
-  const bboxSource = fromBox ?? fromCorners;
+  const bboxSource = fromBox;
   if (!bboxSource || bboxSource.length !== 4) {
+    return null;
+  }
+  const x1 = Number(bboxSource[0] ?? 0);
+  const y1 = Number(bboxSource[1] ?? 0);
+  const x2 = Number(bboxSource[2] ?? 0);
+  const y2 = Number(bboxSource[3] ?? 0);
+  if (!Number.isFinite(x1) || !Number.isFinite(y1) || !Number.isFinite(x2) || !Number.isFinite(y2)) {
+    return null;
+  }
+  if (x2 <= x1 || y2 <= y1) {
+    // Runtime assertion: invalid box contract should be visible during operation.
+    console.error("Invalid bbox(xyxy) received from metadata stream", { bbox: [x1, y1, x2, y2], raw });
     return null;
   }
   const trackId = Number(source.track_id ?? asRecord.id ?? -1);
   const identityIdRaw = source.identity_id ?? asRecord.identityId;
-  const score = Number(asRecord.score ?? asRecord.last_score ?? 0);
+  const score = Number(asRecord.score ?? asRecord.confidence ?? asRecord.last_score ?? 0);
   const label =
     (typeof source.label === "string" && source.label.trim()) ||
     (identityIdRaw !== null && identityIdRaw !== undefined
@@ -47,18 +52,15 @@ function coerceTrack(raw: unknown): TrackPayload | null {
 
   return {
     track_id: trackId,
-    bbox: [
-      Number(bboxSource[0] ?? 0),
-      Number(bboxSource[1] ?? 0),
-      Number(bboxSource[2] ?? 0),
-      Number(bboxSource[3] ?? 0)
-    ],
+    bbox: [x1, y1, x2, y2],
     identity_id:
       identityIdRaw === null || identityIdRaw === undefined
         ? null
         : Number(identityIdRaw),
     label: String(label),
     modality: String(source.modality ?? "none"),
+    age_ratio: Number(asRecord.age_ratio ?? 0),
+    age_frames: Number(asRecord.age_frames ?? 0),
     thumb:
       typeof source.thumb === "string"
         ? source.thumb
@@ -76,12 +78,14 @@ function parseMessage(raw: string): MetadataPayload | null {
       return {
         frame_id: -1,
         timestamp: new Date().toISOString(),
+        source_width: 0,
+        source_height: 0,
         tracks
       };
     }
     const parsed = parsedAny as Partial<MetadataPayload> & {
       tracks?: unknown;
-      payload?: { tracks?: unknown; frame_id?: number; timestamp?: string };
+      payload?: { tracks?: unknown; frame_id?: number; timestamp?: string; source_width?: number; source_height?: number };
     };
     const tracksInput = parsed.payload?.tracks ?? parsed.tracks;
     const rawTracks = Array.isArray(tracksInput)
@@ -96,6 +100,8 @@ function parseMessage(raw: string): MetadataPayload | null {
     return {
       frame_id: Number(parsed.payload?.frame_id ?? parsed.frame_id ?? -1),
       timestamp: String(parsed.payload?.timestamp ?? parsed.timestamp ?? new Date().toISOString()),
+      source_width: Number(parsed.payload?.source_width ?? parsed.source_width ?? 0),
+      source_height: Number(parsed.payload?.source_height ?? parsed.source_height ?? 0),
       tracks
     };
   } catch {

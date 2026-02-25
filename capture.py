@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 from typing import Optional, Tuple
@@ -28,6 +29,7 @@ class CaptureWorker:
         self.imgsz = (int(imgsz[0]), int(imgsz[1]))
         self.frame_store = frame_store
         self.stop_event = stop_event
+        self.capture_buffer = max(1, int(os.getenv("AICAM_CAPTURE_BUFFER", "1")))
         self._thread: Optional[threading.Thread] = None
         self._cap: Optional[cv2.VideoCapture] = None
         self._frame_id = 0
@@ -58,7 +60,7 @@ class CaptureWorker:
         self._cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
         if not self._cap.isOpened():
             return False
-        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, 3)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE, self.capture_buffer)
         LOGGER.info("RTSP connected: %s", src)
         return True
 

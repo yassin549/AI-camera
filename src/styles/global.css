@@ -39,6 +39,32 @@ body {
   color: var(--text-primary);
 }
 
+button:not(:disabled),
+a[href],
+[role="button"],
+[role="switch"],
+[role="radio"],
+[role="option"],
+[role="tab"],
+[role="link"],
+input[type="button"]:not(:disabled),
+input[type="submit"]:not(:disabled),
+input[type="reset"]:not(:disabled),
+input[type="checkbox"]:not(:disabled),
+input[type="radio"]:not(:disabled),
+select:not(:disabled),
+summary,
+[onclick] {
+  cursor: pointer;
+}
+
+button:disabled,
+input:disabled,
+select:disabled,
+[aria-disabled="true"] {
+  cursor: not-allowed;
+}
+
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,

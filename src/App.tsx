@@ -1,4 +1,4 @@
-import { AnimatePresence, LayoutGroup, motion } from "framer-motion";
+import { LayoutGroup } from "framer-motion";
 import { useEffect } from "react";
 import { Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { PremiumSwitch, type ViewMode } from "./components/PremiumSwitch";
@@ -33,7 +33,7 @@ export default function App(): JSX.Element {
             A
           </div>
           <div>
-            <div className="text-sm font-semibold text-slate-100">AIcam Premium UI</div>
+            <div className="text-sm font-semibold text-slate-100">AI Camera</div>
             <div className="text-xs text-slate-400">Low-latency overlays, raw stream preserved</div>
           </div>
         </div>
@@ -46,26 +46,17 @@ export default function App(): JSX.Element {
       <main className="relative h-[calc(100vh-4rem)]">
         <LiveView active={isLiveRoute && !isLibraryRoute} />
 
-        <AnimatePresence mode="wait">
-          {isLibraryRoute ? (
-            <motion.div
-              key={pathname}
-              className="absolute inset-0"
-              initial={{ opacity: 0, y: 8 }}
-              animate={{ opacity: 1, y: 0 }}
-              exit={{ opacity: 0, y: 8 }}
-              transition={{ duration: 0.2 }}
-            >
-              <LayoutGroup>
-                <Routes location={location}>
-                  <Route path="/library" element={<Library />} />
-                  <Route path="/library/:id" element={<IdentityDetail />} />
-                  <Route path="*" element={<Navigate to="/library" replace />} />
-                </Routes>
-              </LayoutGroup>
-            </motion.div>
-          ) : null}
-        </AnimatePresence>
+        {isLibraryRoute ? (
+          <div className="absolute inset-0">
+            <LayoutGroup>
+              <Routes location={location}>
+                <Route path="/library" element={<Library />} />
+                <Route path="/library/:id" element={<IdentityDetail />} />
+                <Route path="*" element={<Navigate to="/library" replace />} />
+              </Routes>
+            </LayoutGroup>
+          </div>
+        ) : null}
       </main>
     </div>
   );

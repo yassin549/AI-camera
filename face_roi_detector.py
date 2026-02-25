@@ -11,9 +11,13 @@ LOGGER = logging.getLogger(__name__)
 
 try:
     import mediapipe as mp
+    FACE_DETECTOR_AVAILABLE = True
+    FACE_DETECTOR_ERROR: str = ""
 except Exception as exc:  # pragma: no cover - import guard
     mp = None
-    LOGGER.warning("MediaPipe unavailable: %s", exc)
+    FACE_DETECTOR_AVAILABLE = False
+    FACE_DETECTOR_ERROR = str(exc)
+    LOGGER.critical("Face detector unavailable: mediapipe import failed: %s", exc)
 
 
 class FaceROIDetector:
@@ -23,11 +27,14 @@ class FaceROIDetector:
         self.min_confidence = float(min_confidence)
         self.model_selection = int(model_selection)
         self._detector = None
+        self.available = bool(FACE_DETECTOR_AVAILABLE)
         if mp is not None:
             self._detector = mp.solutions.face_detection.FaceDetection(
                 model_selection=self.model_selection,
                 min_detection_confidence=self.min_confidence,
             )
+        else:
+            LOGGER.critical("FaceROIDetector running in unavailable mode (no mediapipe backend)")
 
     def detect(self, rgb_roi: np.ndarray) -> List[Tuple[int, int, int, int, float]]:
         """Return list of (x1, y1, x2, y2, score) inside the ROI."""

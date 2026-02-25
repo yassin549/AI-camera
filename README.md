@@ -1,11 +1,14 @@
-# AIcam: Janus WebRTC + Metadata Overlay
+# AIcam: Janus-first Live Video + Metadata Overlay
 
 AIcam now uses a media-gateway architecture:
 - Browser video path: camera RTSP/H264 -> Janus WebRTC -> `<video>` (hardware decode).
 - Python path: detection/tracking/identity only -> metadata WebSocket (`/api/realtime/ws`).
 - Overlay path: metadata WS -> canvas draw over video.
 
-Python frame streaming endpoints (`/api/media/mjpeg`, `/api/media/ws`) are still available as optional fallback but disabled by default.
+Live video transport order is:
+1. Janus WebRTC gateway
+2. API WebRTC (`/webrtc/offer`) fallback
+3. MJPEG (`/api/media/mjpeg`) fallback
 
 ## Why this architecture
 - Python JPEG/MJPEG encode loops are CPU-heavy and add latency.
@@ -52,15 +55,86 @@ npm run dev
 
 ## Frontend environment (optional)
 - `VITE_API_BASE` default: `http://localhost:8080`
-- `VITE_WS_METADATA_URL` default: `ws://localhost:8080/ws/metadata`
+- `VITE_API_KEY` optional shared key sent as `x-api-key` (HTTP) and `api_key` (WS/media query)
+- `VITE_WS_METADATA_URL` default: `ws://localhost:8080/api/realtime/ws`
+- `VITE_WEBRTC_OFFER` default: `http://localhost:8080/webrtc/offer`
 - `VITE_JANUS_HTTP_URL` default: `http://localhost:8088/janus`
 - `VITE_JANUS_MOUNTPOINT` default: `1`
-- `VITE_VIDEO_WS_URL` default: `/api/media/ws`
-- `VITE_DISABLE_WEBRTC=true` forces fallback chain (`WS-JPEG -> MJPEG`)
+- `VITE_DISABLE_WEBRTC=true` skips Janus/API WebRTC and uses MJPEG fallback only.
 
 ## Backend environment (optional)
-- `AICAM_ENABLE_FRAME_STREAMING=1` enables Python frame endpoints (`/api/media/ws`, `/api/media/mjpeg`).
-- Default is disabled to avoid server-side frame encode overhead.
+- `API_KEY` enables shared-key protection for identities/realtime/media/WebRTC endpoints.
+- `CORS_ORIGINS` comma-separated allowlist used by FastAPI CORS middleware (for example Vercel + localhost).
+- `AICAM_ENABLE_FRAME_STREAMING=1` enables MJPEG fallback endpoints (default enabled).
+- `AICAM_MJPEG_FPS` / `AICAM_MJPEG_QUALITY` tune fallback CPU/bandwidth tradeoffs.
+- `AICAM_CAPTURE_BUFFER=1` keeps capture queue short for lower end-to-end latency.
+
+## Split deployment (Vercel frontend + local backend)
+Target topology:
+- Frontend (Vite/React) is deployed on Vercel.
+- Backend (FastAPI + CV pipeline) stays local.
+- Browser calls backend through a public tunnel endpoint.
+
+### 1) Start backend locally
+```bash
+python main.py --config config.yaml --start-api
+```
+
+### 2) Expose backend with a tunnel
+Recommended options:
+
+Cloudflare Tunnel (quick temporary URL):
+```bash
+cloudflared tunnel --url http://localhost:8080
+```
+
+Tailscale Funnel:
+```bash
+tailscale funnel 8080
+```
+
+Use the produced public HTTPS URL as your backend base (for example `https://xxxx.trycloudflare.com`).
+
+### 3) Backend env vars (local machine)
+Set these before starting Python:
+```bash
+API_KEY=your-shared-secret
+CORS_ORIGINS=https://your-app.vercel.app,http://localhost:5173,http://127.0.0.1:5173
+```
+
+Notes:
+- `CORS_ORIGINS` is read by `config.py` and passed to FastAPI CORS middleware.
+- Keep your Vercel origin in `CORS_ORIGINS`, and keep localhost origins if you still use local frontend dev.
+
+### 4) Vercel env vars (frontend project)
+Set in Vercel Project Settings -> Environment Variables:
+```bash
+VITE_API_BASE=https://your-public-backend.example.com
+VITE_API_KEY=your-shared-secret
+```
+
+Optional overrides:
+```bash
+VITE_WS_METADATA_URL=wss://your-public-backend.example.com/api/realtime/ws
+VITE_WEBRTC_OFFER=https://your-public-backend.example.com/webrtc/offer
+VITE_JANUS_HTTP_URL=https://your-janus-endpoint.example.com/janus
+VITE_JANUS_MOUNTPOINT=1
+```
+
+If `VITE_API_KEY` is set, the frontend will:
+- Send `x-api-key` on HTTP requests.
+- Append `api_key` to WS/media URLs where headers are unavailable in browser primitives.
+
+### 5) Deploy frontend to Vercel
+This repo includes `vercel.json` with SPA rewrite to `index.html`.
+
+CLI flow:
+```bash
+npm run build
+vercel
+```
+
+Or connect the Git repository in Vercel and set the same environment variables there.
 
 ## Janus live-view integration sample
 Use this pattern in `src/pages/LiveView.jsx` / `src/components/VideoCanvas.tsx`:
@@ -110,10 +184,24 @@ async function startJanus(videoEl) {
 ```
 
 ## API endpoints
-- `GET /api/health` -> `{"status":"ok","time":"..."}`
+- `GET /api/health` / `GET /health` -> health + capabilities (`face_detector_available`, `processing_resolution`, etc.)
+- `GET /metrics` -> runtime counters/gauges (`face_attempts`, `face_detections`, `embedding_success`, `db_writes`, `active_tracks`, ...)
 - `GET /api/identities` -> identity list JSON
 - `GET /api/realtime/latest` -> latest metadata payload
 - `WS /api/realtime/ws` -> metadata stream
+
+## Pipeline tuning keys (`config.yaml`)
+- `detection_interval` (default `1`)
+- `adaptive_detection_interval` (default `true`)
+- `detection_interval_max` (default `6`)
+- `target_fps` (default `30`)
+- `max_track_age_frames` (default `24`)
+- `face_interval_frames` (default `4`)
+- `face_top_ratio` (default `0.68`)
+- `face_min_pixels` (default `40`)
+- `body_fallback_enabled` (default `true`)
+- `body_fallback_after_face_failures` (default `3`)
+- `body_fallback_model_path` (default empty -> color-hist fallback)
 
 ## Verification checklist
 - Janus container is healthy: `docker compose ps janus`
@@ -122,10 +210,10 @@ async function startJanus(videoEl) {
 - Boxes and IDs render in overlay from metadata WS.
 - `curl http://127.0.0.1:8080/api/health` returns status JSON.
 - `curl http://127.0.0.1:8080/api/identities` returns JSON list.
-- Stop Janus: frontend should fail over to fallback transport instead of crashing.
+- Stop Janus: frontend should automatically fall back to API WebRTC or MJPEG.
 
 ## Debug checklist
-- No Janus video: verify `VITE_JANUS_HTTP_URL` and `VITE_JANUS_MOUNTPOINT`.
+- No Janus video: verify `VITE_JANUS_HTTP_URL` and `VITE_JANUS_MOUNTPOINT`; UI should still fall back automatically.
 - No overlay: verify metadata WS at `/api/realtime/ws`.
-- High backend CPU: ensure `AICAM_ENABLE_FRAME_STREAMING` is not enabled.
+- High backend CPU: verify Janus is ingesting a direct H264 stream (`-c copy`) and avoid re-encode hops.
 - Camera pull issues in Janus: use `scripts/ffmpeg-push.sh` with `-c copy` and ingest via your gateway path.

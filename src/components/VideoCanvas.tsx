@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
+  postWebRtcOffer,
   resolveMetadataWsUrl,
+  withApiKeyHeaders,
+  withApiKeyQuery,
   type MetadataPayload,
   type TrackPayload
 } from "../api/client";
@@ -15,13 +18,11 @@ interface VideoCanvasProps {
   metadataUrl?: string;
   janusHttpUrl?: string;
   janusMountpoint?: number;
-  videoWsUrl?: string;
-  fallbackSrc?: string;
   onTrackFocus?: (track: TrackPayload | null) => void;
   onRosterChange?: (tracks: TrackPayload[]) => void;
 }
 
-type TransportMode = "connecting" | "janus" | "wsjpeg" | "mjpeg";
+type TransportMode = "connecting" | "janus" | "webrtc" | "mjpeg" | "error";
 
 interface ProjectedTrack {
   track: TrackPayload;
@@ -39,9 +40,14 @@ interface CanvasMetrics {
 }
 
 interface DrawCache {
-  frameId: number;
+  tracksKey: string;
   sizeKey: string;
   focusedTrackId: number | null;
+}
+
+interface RosterEmitCache {
+  key: string;
+  at: number;
 }
 
 const THUMB_SIZE = 34;
@@ -101,28 +107,49 @@ function resolveApiUrl(pathOrUrl: string): string {
   return `${base}${path}`;
 }
 
-function resolveWsUrl(pathOrUrl: string): string {
-  if (!pathOrUrl) {
-    return "";
-  }
-  if (/^wss?:\/\//i.test(pathOrUrl)) {
-    return pathOrUrl;
-  }
-  if (/^https?:\/\//i.test(pathOrUrl)) {
-    return pathOrUrl.replace(/^http/i, "ws");
-  }
-  if (pathOrUrl.startsWith("/")) {
-    if (API.REST_BASE && /^https?:\/\//i.test(API.REST_BASE)) {
-      return `${API.REST_BASE.replace(/^http/i, "ws").replace(/\/+$/, "")}${pathOrUrl}`;
-    }
-    const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    return `${protocol}//${window.location.host}${pathOrUrl}`;
-  }
-  return pathOrUrl;
-}
-
 function nextTx(): string {
   return Math.random().toString(36).slice(2, 12);
+}
+
+function computeTracksKey(payload: MetadataPayload | null): string {
+  if (!payload || payload.tracks.length === 0) {
+    return "none";
+  }
+  return payload.tracks
+    .map((track) => {
+      const [x, y, w, h] = track.bbox;
+      return `${track.track_id}:${x},${y},${w},${h}:${track.identity_id ?? "n"}:${track.label}`;
+    })
+    .join("|");
+}
+
+function computeRosterKey(tracks: TrackPayload[]): string {
+  if (!tracks.length) {
+    return "none";
+  }
+  return tracks
+    .map((track) => `${track.track_id}:${track.identity_id ?? "n"}:${track.label}`)
+    .join("|");
+}
+
+async function waitForIceGatheringComplete(pc: RTCPeerConnection, timeoutMs = 2000): Promise<void> {
+  if (pc.iceGatheringState === "complete") {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const timeout = window.setTimeout(() => {
+      pc.removeEventListener("icegatheringstatechange", onStateChange);
+      resolve();
+    }, timeoutMs);
+    const onStateChange = () => {
+      if (pc.iceGatheringState === "complete") {
+        window.clearTimeout(timeout);
+        pc.removeEventListener("icegatheringstatechange", onStateChange);
+        resolve();
+      }
+    };
+    pc.addEventListener("icegatheringstatechange", onStateChange);
+  });
 }
 
 export function VideoCanvas({
@@ -133,28 +160,29 @@ export function VideoCanvas({
   metadataUrl,
   janusHttpUrl = API.JANUS_HTTP,
   janusMountpoint = API.JANUS_MOUNTPOINT,
-  videoWsUrl = API.VIDEO_WS,
-  fallbackSrc = API.MJPEG_FALLBACK,
   onTrackFocus,
   onRosterChange
 }: VideoCanvasProps): JSX.Element {
-  const resolvedWsUrl = useMemo(() => metadataUrl ?? resolveMetadataWsUrl(), [metadataUrl]);
+  const resolvedWsUrl = useMemo(
+    () => withApiKeyQuery(metadataUrl ?? resolveMetadataWsUrl()),
+    [metadataUrl]
+  );
   const resolvedJanusHttpUrl = useMemo(() => resolveApiUrl(janusHttpUrl).replace(/\/+$/, ""), [janusHttpUrl]);
+  const resolvedMjpegUrl = useMemo(() => withApiKeyQuery(resolveApiUrl("/api/media/mjpeg")), []);
   const resolvedJanusMountpoint = useMemo(
     () => (Number.isFinite(janusMountpoint) && Number(janusMountpoint) > 0 ? Number(janusMountpoint) : 1),
     [janusMountpoint]
   );
-  const resolvedVideoWsUrl = useMemo(() => resolveWsUrl(videoWsUrl), [videoWsUrl]);
-  const resolvedFallbackSrc = useMemo(() => resolveApiUrl(fallbackSrc), [fallbackSrc]);
   const disableWebRtc = (import.meta.env.VITE_DISABLE_WEBRTC as string | undefined) === "true";
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
-  const mjpegImgRef = useRef<HTMLImageElement | null>(null);
+  const mjpegRef = useRef<HTMLImageElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const projectedTracksRef = useRef<ProjectedTrack[]>([]);
   const thumbCacheRef = useRef<Map<string, HTMLImageElement>>(new Map());
   const latestMetadataRef = useRef<MetadataPayload | null>(null);
-  const drawCacheRef = useRef<DrawCache>({ frameId: -1, sizeKey: "", focusedTrackId: null });
+  const drawCacheRef = useRef<DrawCache>({ tracksKey: "", sizeKey: "", focusedTrackId: null });
+  const rosterEmitRef = useRef<RosterEmitCache>({ key: "", at: 0 });
   const metricsRef = useRef<CanvasMetrics>({ cssWidth: 0, cssHeight: 0, sourceWidth: 0, sourceHeight: 0 });
   const resizeKeyRef = useRef(0);
   const rafRef = useRef<number | null>(null);
@@ -163,12 +191,11 @@ export function VideoCanvas({
   const janusSessionRef = useRef<number | null>(null);
   const janusHandleRef = useRef<number | null>(null);
   const janusKeepaliveRef = useRef<number | null>(null);
-  const wsVideoRef = useRef<WebSocket | null>(null);
-  const wsBlobUrlRef = useRef<string | null>(null);
   const transportModeRef = useRef<TransportMode>("connecting");
 
   const [transportMode, setTransportMode] = useState<TransportMode>("connecting");
   const [transportError, setTransportError] = useState<string | null>(null);
+  const [faceDetectorUnavailable, setFaceDetectorUnavailable] = useState(false);
 
   const realtime = useRealtime({
     url: resolvedWsUrl,
@@ -183,11 +210,19 @@ export function VideoCanvas({
         tracks: resolvedTracks
       };
       latestMetadataRef.current = resolvedPayload;
-      onRosterChange?.(resolvedTracks);
+      if (onRosterChange) {
+        const nextKey = computeRosterKey(resolvedTracks);
+        const now = performance.now();
+        const prev = rosterEmitRef.current;
+        if (nextKey !== prev.key || now - prev.at >= 200) {
+          rosterEmitRef.current = { key: nextKey, at: now };
+          onRosterChange(resolvedTracks);
+        }
+      }
     }
   });
 
-  const closeJanusTransport = () => {
+  const closeTransport = () => {
     if (janusKeepaliveRef.current !== null) {
       window.clearInterval(janusKeepaliveRef.current);
       janusKeepaliveRef.current = null;
@@ -205,6 +240,20 @@ export function VideoCanvas({
       pc.onicecandidate = null;
       pc.close();
       janusPcRef.current = null;
+    }
+    const video = videoRef.current;
+    if (video) {
+      video.pause();
+      video.srcObject = null;
+      video.removeAttribute("src");
+      video.style.display = "block";
+    }
+    const mjpeg = mjpegRef.current;
+    if (mjpeg) {
+      mjpeg.onload = null;
+      mjpeg.onerror = null;
+      mjpeg.style.display = "none";
+      mjpeg.removeAttribute("src");
     }
 
     const sessionId = janusSessionRef.current;
@@ -224,149 +273,37 @@ export function VideoCanvas({
     }).catch(() => undefined);
   };
 
-  const releaseWsBlobUrl = () => {
-    const url = wsBlobUrlRef.current;
-    if (!url) {
-      return;
-    }
-    window.URL.revokeObjectURL(url);
-    wsBlobUrlRef.current = null;
-  };
-
-  const closeWsVideo = () => {
-    const ws = wsVideoRef.current;
-    if (ws) {
-      ws.onopen = null;
-      ws.onclose = null;
-      ws.onerror = null;
-      ws.onmessage = null;
-      ws.close();
-      wsVideoRef.current = null;
-    }
-    releaseWsBlobUrl();
-  };
-
-  const activateMjpegFallback = () => {
-    const video = videoRef.current;
-    if (video) {
-      video.srcObject = null;
-      video.removeAttribute("src");
-      video.style.display = "none";
-    }
-    closeJanusTransport();
-    closeWsVideo();
-    const img = mjpegImgRef.current;
-    if (img) {
-      img.src = resolvedFallbackSrc;
-      img.style.display = "block";
-    }
-    transportModeRef.current = "mjpeg";
-    setTransportMode("mjpeg");
-  };
-
-  const activateWsJpegFallback = async (): Promise<boolean> => {
-    if (!resolvedVideoWsUrl) {
-      return false;
-    }
-    const img = mjpegImgRef.current;
-    if (!img) {
-      return false;
-    }
-    closeWsVideo();
-    closeJanusTransport();
-    img.style.display = "block";
-
-    return await new Promise<boolean>((resolve) => {
-      let settled = false;
-      const finish = (ok: boolean) => {
-        if (settled) {
-          return;
-        }
-        settled = true;
-        resolve(ok);
-      };
-
-      try {
-        const ws = new WebSocket(resolvedVideoWsUrl);
-        ws.binaryType = "arraybuffer";
-        wsVideoRef.current = ws;
-        const timeout = window.setTimeout(() => {
-          if (ws.readyState !== WebSocket.OPEN) {
-            ws.close();
-            finish(false);
-          }
-        }, 1500);
-
-        ws.onopen = () => {
-          window.clearTimeout(timeout);
-          transportModeRef.current = "wsjpeg";
-          setTransportMode("wsjpeg");
-          finish(true);
-        };
-
-        ws.onmessage = (event) => {
-          const payload =
-            event.data instanceof Blob
-              ? event.data
-              : new Blob([event.data as ArrayBuffer], { type: "image/jpeg" });
-          const nextUrl = window.URL.createObjectURL(payload);
-          const previous = wsBlobUrlRef.current;
-          wsBlobUrlRef.current = nextUrl;
-          img.src = nextUrl;
-          if (previous) {
-            window.setTimeout(() => window.URL.revokeObjectURL(previous), 1200);
-          }
-        };
-
-        ws.onerror = () => {
-          window.clearTimeout(timeout);
-          if (ws.readyState !== WebSocket.OPEN) {
-            finish(false);
-          }
-        };
-
-        ws.onclose = () => {
-          window.clearTimeout(timeout);
-          if (wsVideoRef.current === ws) {
-            wsVideoRef.current = null;
-          }
-          if (!settled) {
-            finish(false);
-            return;
-          }
-          if (transportModeRef.current === "wsjpeg") {
-            activateMjpegFallback();
-          }
-        };
-      } catch {
-        finish(false);
-      }
-    });
-  };
-
   useEffect(() => {
     let cancelled = false;
     const video = videoRef.current;
-    const img = mjpegImgRef.current;
+    const mjpeg = mjpegRef.current;
     if (!active) {
-      closeJanusTransport();
-      closeWsVideo();
-      if (video) {
-        video.pause();
-        video.srcObject = null;
-        video.removeAttribute("src");
-      }
-      if (img) {
-        img.removeAttribute("src");
-        img.style.display = "none";
-      }
+      closeTransport();
       transportModeRef.current = "connecting";
       setTransportMode("connecting");
+      setTransportError(null);
       return;
     }
-    if (!video) {
+    if (!video || !mjpeg) {
       return;
     }
+
+    const hideMjpeg = () => {
+      mjpeg.style.display = "none";
+      mjpeg.removeAttribute("src");
+    };
+    const showVideo = () => {
+      video.style.display = "block";
+      hideMjpeg();
+    };
+    const showMjpeg = (url: string) => {
+      video.pause();
+      video.srcObject = null;
+      video.removeAttribute("src");
+      video.style.display = "none";
+      mjpeg.style.display = "block";
+      mjpeg.src = url;
+    };
 
     const janusPost = async (
       path: string,
@@ -382,12 +319,18 @@ export function VideoCanvas({
       if (!response.ok) {
         throw new Error(`Janus HTTP ${response.status}`);
       }
-      return (await response.json()) as Record<string, unknown>;
+      const payload = (await response.json()) as Record<string, unknown>;
+      if (payload.janus === "error") {
+        const error = payload.error as { code?: number; reason?: string } | undefined;
+        const reason = error?.reason ?? `code ${error?.code ?? "unknown"}`;
+        throw new Error(`Janus error: ${reason}`);
+      }
+      return payload;
     };
 
-    const startJanusTransport = async (): Promise<boolean> => {
+    const startJanusTransport = async (): Promise<{ ok: boolean; error: string }> => {
       if (!resolvedJanusHttpUrl || typeof RTCPeerConnection === "undefined") {
-        return false;
+        return { ok: false, error: "Janus endpoint or browser WebRTC unavailable" };
       }
       const abort = new AbortController();
       const signal = abort.signal;
@@ -417,12 +360,7 @@ export function VideoCanvas({
         janusPcRef.current = pc;
         pc.ontrack = (event) => {
           if (event.streams[0]) {
-            closeWsVideo();
-            if (img) {
-              img.removeAttribute("src");
-              img.style.display = "none";
-            }
-            video.style.display = "block";
+            showVideo();
             video.srcObject = event.streams[0];
             video.play().catch(() => undefined);
             transportModeRef.current = "janus";
@@ -467,7 +405,7 @@ export function VideoCanvas({
           while (!signal.aborted && janusSessionRef.current && janusHandleRef.current) {
             const rid = Date.now();
             const response = await fetch(
-              `${resolvedJanusHttpUrl}/${janusSessionRef.current}?rid=${rid}&maxev=1`,
+              `${resolvedJanusHttpUrl}/${janusSessionRef.current}?rid=${rid}&maxev=10`,
               { signal }
             );
             if (!response.ok) {
@@ -514,63 +452,225 @@ export function VideoCanvas({
           }
         };
 
-        void pollEvents().catch(async (err: unknown) => {
+        void pollEvents().catch((err: unknown) => {
           if (signal.aborted || cancelled) {
             return;
           }
           const message = err instanceof Error ? err.message : "Janus polling failed";
           setTransportError(`Janus stream error: ${message}`);
-          const wsReady = await activateWsJpegFallback();
-          if (!wsReady) {
-            activateMjpegFallback();
-          }
+          transportModeRef.current = "error";
+          setTransportMode("error");
+          closeTransport();
         });
 
-        return true;
-      } catch {
+        return { ok: true, error: "" };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "Janus negotiation failed";
         if (sessionId && !signal.aborted) {
           void janusPost(`/${sessionId}`, { janus: "destroy" }, signal).catch(() => undefined);
         }
-        closeJanusTransport();
-        return false;
+        closeTransport();
+        return { ok: false, error: message };
       }
     };
 
-    const bootstrapVideo = async () => {
-      if (disableWebRtc) {
-        setTransportError("WebRTC disabled by VITE_DISABLE_WEBRTC; using fallback transport");
-        const wsReady = await activateWsJpegFallback();
-        if (!wsReady) {
-          activateMjpegFallback();
+    const startApiWebRtcTransport = async (): Promise<{ ok: boolean; error: string }> => {
+      if (typeof RTCPeerConnection === "undefined") {
+        return { ok: false, error: "Browser WebRTC unavailable" };
+      }
+      try {
+        const pc = new RTCPeerConnection();
+        janusPcRef.current = pc;
+        const firstTrack = new Promise<boolean>((resolve) => {
+          const timeout = window.setTimeout(() => resolve(false), 7000);
+          pc.ontrack = (event) => {
+            if (!event.streams[0]) {
+              return;
+            }
+            window.clearTimeout(timeout);
+            showVideo();
+            video.srcObject = event.streams[0];
+            video.play().catch(() => undefined);
+            transportModeRef.current = "webrtc";
+            setTransportMode("webrtc");
+            setTransportError(null);
+            resolve(true);
+          };
+        });
+
+        pc.addTransceiver("video", { direction: "recvonly" });
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        await waitForIceGatheringComplete(pc, 2000);
+        const local = pc.localDescription;
+        if (!local?.sdp) {
+          throw new Error("Local WebRTC offer is empty");
         }
-        return;
+        const answer = await postWebRtcOffer({ sdp: local.sdp, type: "offer" });
+        await pc.setRemoteDescription(answer as RTCSessionDescriptionInit);
+        const gotTrack = await firstTrack;
+        if (!gotTrack) {
+          throw new Error("No media track received");
+        }
+        return { ok: true, error: "" };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "API WebRTC negotiation failed";
+        closeTransport();
+        return { ok: false, error: message };
+      }
+    };
+
+    const startMjpegTransport = async (): Promise<{ ok: boolean; error: string }> => {
+      const separator = resolvedMjpegUrl.includes("?") ? "&" : "?";
+      const probeUrl = `${resolvedMjpegUrl}${separator}probe=1&_=${Date.now()}`;
+      const probeAbort = new AbortController();
+      const timeoutId = window.setTimeout(() => probeAbort.abort(), 3000);
+      try {
+        const response = await fetch(probeUrl, {
+          method: "GET",
+          headers: withApiKeyHeaders(),
+          signal: probeAbort.signal
+        });
+        window.clearTimeout(timeoutId);
+        if (!response.ok) {
+          let details = "";
+          try {
+            details = await response.text();
+          } catch {
+            details = "";
+          }
+          return {
+            ok: false,
+            error: details ? `HTTP ${response.status}: ${details}` : `HTTP ${response.status}`,
+          };
+        }
+        void response.body?.cancel().catch(() => undefined);
+      } catch (err: unknown) {
+        window.clearTimeout(timeoutId);
+        const message = err instanceof Error ? err.message : "MJPEG probe failed";
+        return { ok: false, error: message };
       }
 
+      const streamUrl = `${resolvedMjpegUrl}${separator}stream=1&_=${Date.now()}`;
+      const loaded = await new Promise<boolean>((resolve) => {
+        const timeout = window.setTimeout(() => {
+          mjpeg.onload = null;
+          mjpeg.onerror = null;
+          resolve(false);
+        }, 5000);
+        mjpeg.onload = () => {
+          window.clearTimeout(timeout);
+          mjpeg.onload = null;
+          mjpeg.onerror = null;
+          resolve(true);
+        };
+        mjpeg.onerror = () => {
+          window.clearTimeout(timeout);
+          mjpeg.onload = null;
+          mjpeg.onerror = null;
+          resolve(false);
+        };
+        showMjpeg(streamUrl);
+      });
+
+      if (!loaded) {
+        hideMjpeg();
+        return { ok: false, error: "MJPEG stream did not start" };
+      }
+      transportModeRef.current = "mjpeg";
+      setTransportMode("mjpeg");
+      setTransportError(null);
+      return { ok: true, error: "" };
+    };
+
+    const bootstrapVideo = async () => {
+      setTransportError(null);
+      transportModeRef.current = "connecting";
       setTransportMode("connecting");
-      const janusReady = await startJanusTransport();
+
+      const failures: string[] = [];
+      if (!disableWebRtc) {
+        const janusReady = await startJanusTransport();
+        if (cancelled) {
+          return;
+        }
+        if (janusReady.ok) {
+          return;
+        }
+        failures.push(`Janus: ${janusReady.error}`);
+
+        const apiWebRtcReady = await startApiWebRtcTransport();
+        if (cancelled) {
+          return;
+        }
+        if (apiWebRtcReady.ok) {
+          return;
+        }
+        failures.push(`API WebRTC: ${apiWebRtcReady.error}`);
+      } else {
+        failures.push("WebRTC disabled by VITE_DISABLE_WEBRTC=true");
+      }
+
+      const mjpegReady = await startMjpegTransport();
       if (cancelled) {
         return;
       }
-      if (!janusReady) {
-        setTransportError("Janus WebRTC unavailable; using fallback transport");
-        const wsReady = await activateWsJpegFallback();
-        if (!wsReady) {
-          activateMjpegFallback();
-        }
+      if (mjpegReady.ok) {
+        return;
       }
+      failures.push(`MJPEG: ${mjpegReady.error}`);
+      transportModeRef.current = "error";
+      setTransportMode("error");
+      setTransportError(failures.join(" | "));
     };
 
     bootstrapVideo();
 
     return () => {
       cancelled = true;
-      closeJanusTransport();
-      closeWsVideo();
+      closeTransport();
     };
-  }, [active, disableWebRtc, resolvedFallbackSrc, resolvedJanusHttpUrl, resolvedJanusMountpoint, resolvedVideoWsUrl]);
+  }, [active, disableWebRtc, resolvedJanusHttpUrl, resolvedJanusMountpoint, resolvedMjpegUrl]);
 
   useEffect(() => {
     if (!active) {
+      setFaceDetectorUnavailable(false);
+      return;
+    }
+    let cancelled = false;
+    const healthUrl = resolveApiUrl("/api/health");
+
+    const pollHealth = async () => {
+      try {
+        const response = await fetch(healthUrl, { method: "GET", headers: withApiKeyHeaders() });
+        if (!response.ok) {
+          return;
+        }
+        const payload = (await response.json()) as { face_detector_available?: boolean };
+        if (!cancelled) {
+          setFaceDetectorUnavailable(payload.face_detector_available === false);
+        }
+      } catch {
+        // Health polling is best-effort; keep current state on transient failures.
+      }
+    };
+
+    void pollHealth();
+    const timer = window.setInterval(() => {
+      void pollHealth();
+    }, 10000);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [active]);
+
+  useEffect(() => {
+    if (!active) {
+      latestMetadataRef.current = null;
+      drawCacheRef.current = { tracksKey: "", sizeKey: "", focusedTrackId: null };
+      rosterEmitRef.current = { key: "", at: 0 };
       onTrackFocus?.(null);
       onRosterChange?.([]);
     }
@@ -592,32 +692,32 @@ export function VideoCanvas({
     const draw = () => {
       const canvas = canvasRef.current;
       const video = videoRef.current;
-      const img = mjpegImgRef.current;
       const container = containerRef.current;
       if (!canvas || !container) {
         rafRef.current = window.requestAnimationFrame(draw);
         return;
       }
 
-      const isImageFallback =
-        transportModeRef.current === "mjpeg" || transportModeRef.current === "wsjpeg";
-
-      // Determine source dimensions from the active media element
+      // Determine source dimensions from the active video element
       let nativeW = 0;
       let nativeH = 0;
-      if (isImageFallback && img) {
-        nativeW = img.naturalWidth;
-        nativeH = img.naturalHeight;
-      } else if (video) {
+      if (video) {
         nativeW = video.videoWidth;
         nativeH = video.videoHeight;
+      }
+      if ((!nativeW || !nativeH) && mjpegRef.current) {
+        nativeW = mjpegRef.current.naturalWidth;
+        nativeH = mjpegRef.current.naturalHeight;
       }
 
       const rect = container.getBoundingClientRect();
       const cssWidth = Math.max(1, Math.round(rect.width));
       const cssHeight = Math.max(1, Math.round(rect.height));
-      const sourceWidth = Math.max(1, Math.round(nativeW || cssWidth));
-      const sourceHeight = Math.max(1, Math.round(nativeH || cssHeight));
+      const latest = latestMetadataRef.current;
+      const metadataSourceWidth = Number(latest?.source_width ?? 0);
+      const metadataSourceHeight = Number(latest?.source_height ?? 0);
+      const sourceWidth = Math.max(1, Math.round(metadataSourceWidth > 0 ? metadataSourceWidth : nativeW || cssWidth));
+      const sourceHeight = Math.max(1, Math.round(metadataSourceHeight > 0 ? metadataSourceHeight : nativeH || cssHeight));
       const dpr = window.devicePixelRatio || 1;
 
       const bufferWidth = pixelPerfect ? Math.round(sourceWidth * dpr) : Math.round(cssWidth * dpr);
@@ -650,12 +750,11 @@ export function VideoCanvas({
         sourceHeight
       };
 
-      const latest = latestMetadataRef.current;
+      const tracksKey = computeTracksKey(latest);
       const sizeKey = `${cssWidth}x${cssHeight}:${sourceWidth}x${sourceHeight}:${resizeKeyRef.current}:${pixelPerfect ? "pp" : "fit"}`;
-      const latestFrameId = latest?.frame_id ?? -1;
       const cache = drawCacheRef.current;
       const shouldDraw =
-        cache.frameId !== latestFrameId ||
+        cache.tracksKey !== tracksKey ||
         cache.sizeKey !== sizeKey ||
         cache.focusedTrackId !== focusedTrackId;
       if (!shouldDraw || !active) {
@@ -663,7 +762,7 @@ export function VideoCanvas({
         return;
       }
 
-      cache.frameId = latestFrameId;
+      cache.tracksKey = tracksKey;
       cache.sizeKey = sizeKey;
       cache.focusedTrackId = focusedTrackId;
 
@@ -684,26 +783,15 @@ export function VideoCanvas({
       const scaleY = renderHeight / sourceHeight;
 
       for (const track of latest.tracks) {
-        const [rawX, rawY, raw3, raw4] = track.bbox;
-        const xywhFits =
-          raw3 > 0 &&
-          raw4 > 0 &&
-          rawX >= 0 &&
-          rawY >= 0 &&
-          rawX + raw3 <= sourceWidth + 2 &&
-          rawY + raw4 <= sourceHeight + 2;
-        const xyxyFits =
-          raw3 > rawX &&
-          raw4 > rawY &&
-          rawX >= 0 &&
-          rawY >= 0 &&
-          raw3 <= sourceWidth + 2 &&
-          raw4 <= sourceHeight + 2;
-        const useXyxy = xyxyFits && (!xywhFits || !API.USE_MOCK);
-        const bx = rawX;
-        const by = rawY;
-        const bw = useXyxy ? raw3 - rawX : raw3;
-        const bh = useXyxy ? raw4 - rawY : raw4;
+        const [x1, y1, x2, y2] = track.bbox;
+        const bw = x2 - x1;
+        const bh = y2 - y1;
+        if (bw <= 0 || bh <= 0) {
+          console.error("Invalid bbox(xyxy) received from metadata stream", { bbox: track.bbox, trackId: track.track_id });
+          continue;
+        }
+        const bx = x1;
+        const by = y1;
         const x = offsetX + bx * scaleX;
         const y = offsetY + by * scaleY;
         const w = bw * scaleX;
@@ -713,30 +801,30 @@ export function VideoCanvas({
         }
 
         const isFocused = focusedTrackId !== null && focusedTrackId === track.track_id;
-        const accent = isFocused ? "rgba(255, 198, 89, 1)" : "rgba(124, 92, 255, 0.95)";
-        const fill = isFocused ? "rgba(255, 198, 89, 0.13)" : "rgba(124, 92, 255, 0.11)";
+        const ageRatio = Math.max(0, Math.min(1, Number(track.age_ratio ?? 0)));
+        const freshness = 1 - ageRatio;
+        const strokeAlpha = isFocused ? 1 : 0.35 + freshness * 0.6;
+        const fillAlpha = isFocused ? 0.13 : 0.05 + freshness * 0.11;
+        const accent = isFocused
+          ? "rgba(255, 198, 89, 1)"
+          : `rgba(124, 92, 255, ${Math.max(0.2, Math.min(1, strokeAlpha)).toFixed(3)})`;
+        const fill = isFocused
+          ? "rgba(255, 198, 89, 0.13)"
+          : `rgba(124, 92, 255, ${Math.max(0.03, Math.min(0.25, fillAlpha)).toFixed(3)})`;
 
-        ctx.save();
-        ctx.shadowBlur = 14;
-        ctx.shadowColor = "rgba(0, 0, 0, 0.35)";
         ctx.fillStyle = fill;
         ctx.strokeStyle = accent;
         ctx.lineWidth = 1.3;
         ctx.fillRect(x, y, w, h);
         ctx.strokeRect(x, y, w, h);
-        ctx.restore();
 
         if (track.thumb) {
           const image = getOrCreateImage(track.thumb, thumbCacheRef.current);
           if (image.complete) {
-            ctx.save();
-            ctx.shadowBlur = 8;
-            ctx.shadowColor = "rgba(0, 0, 0, 0.28)";
             ctx.drawImage(image, x + 6, y + 6, THUMB_SIZE, THUMB_SIZE);
             ctx.strokeStyle = "rgba(255,255,255,0.7)";
             ctx.lineWidth = 1;
             ctx.strokeRect(x + 6, y + 6, THUMB_SIZE, THUMB_SIZE);
-            ctx.restore();
           }
         }
 
@@ -780,18 +868,18 @@ export function VideoCanvas({
         muted
         playsInline
         className="h-full w-full object-contain"
-        style={{ display: transportMode === "janus" ? "block" : "none" }}
+        style={{ display: "block" }}
         aria-label="Live camera stream"
       />
       <img
-        ref={mjpegImgRef}
-        alt="Fallback live stream"
-        className="h-full w-full object-contain"
-        style={{ display: transportMode === "mjpeg" || transportMode === "wsjpeg" ? "block" : "none" }}
+        ref={mjpegRef}
+        className="absolute inset-0 h-full w-full object-contain"
+        style={{ display: "none" }}
+        alt="Live camera MJPEG stream"
       />
       <canvas
         ref={canvasRef}
-        className="absolute inset-0"
+        className="absolute inset-0 cursor-pointer"
         onClick={handleCanvasClick}
         role="application"
         aria-label="Identity overlays"
@@ -803,11 +891,16 @@ export function VideoCanvas({
       </div>
       {transportError ? (
         <div className="pointer-events-none absolute right-3 top-3 rounded-lg bg-amber-300/90 px-3 py-2 text-xs font-medium text-slate-950 shadow-soft">
-          Live stream fallback active ({transportError})
+          Live stream unavailable ({transportError})
+        </div>
+      ) : null}
+      {faceDetectorUnavailable ? (
+        <div className="pointer-events-none absolute right-3 top-14 rounded-lg bg-rose-400/90 px-3 py-2 text-xs font-medium text-slate-950 shadow-soft">
+          Face detector unavailable (mediapipe not installed)
         </div>
       ) : null}
       {realtime.error ? (
-        <div className="pointer-events-none absolute right-3 top-14 rounded-lg bg-rose-400/90 px-3 py-2 text-xs font-medium text-slate-950 shadow-soft">
+        <div className="pointer-events-none absolute right-3 top-24 rounded-lg bg-rose-400/90 px-3 py-2 text-xs font-medium text-slate-950 shadow-soft">
           Metadata channel reconnecting...
         </div>
       ) : null}
