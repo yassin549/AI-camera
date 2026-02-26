@@ -1,0 +1,2 @@
+# Frontend deploy only: prevent Python runtime auto-detection from backend deps.
+requirements.txt
