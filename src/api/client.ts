@@ -414,3 +414,7 @@ export async function muteIdentity(id: string): Promise<{ ok: true }> {
 export function resolveMetadataWsUrl(): string {
   return withApiKeyQuery(toWsUrl(API.WS_METADATA));
 }
+
+export function resolveMetadataLatestUrl(): string {
+  return withApiKeyQuery(toMediaUrl(API.METADATA_LATEST));
+}

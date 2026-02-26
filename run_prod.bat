@@ -1,2 +1,2 @@
 @echo off
-.\venv\Scripts\python.exe main.py --headless --use-waitress --verbose %*
+.\venv\Scripts\python.exe main.py --config config.yaml --start-api --no-display %*

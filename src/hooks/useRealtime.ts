@@ -7,6 +7,9 @@ interface UseRealtimeOptions {
   url: string;
   enabled?: boolean;
   onMessage?: (payload: MetadataPayload) => void;
+  latestUrl?: string;
+  pollIntervalMs?: number;
+  headers?: HeadersInit;
 }
 
 interface UseRealtimeResult {
@@ -70,9 +73,8 @@ function coerceTrack(raw: unknown): TrackPayload | null {
   };
 }
 
-function parseMessage(raw: string): MetadataPayload | null {
+function normalizePayload(parsedAny: unknown): MetadataPayload | null {
   try {
-    const parsedAny = JSON.parse(raw) as unknown;
     if (Array.isArray(parsedAny)) {
       const tracks = parsedAny.map(coerceTrack).filter((v): v is TrackPayload => v !== null);
       return {
@@ -109,10 +111,19 @@ function parseMessage(raw: string): MetadataPayload | null {
   }
 }
 
+function parseMessage(raw: string): MetadataPayload | null {
+  try {
+    return normalizePayload(JSON.parse(raw) as unknown);
+  } catch {
+    return null;
+  }
+}
+
 export function useRealtime(options: UseRealtimeOptions): UseRealtimeResult {
-  const { url, enabled = true, onMessage } = options;
+  const { url, enabled = true, onMessage, latestUrl, pollIntervalMs = 250, headers } = options;
   const wsRef = useRef<WebSocket | null>(null);
-  const timerRef = useRef<number | null>(null);
+  const reconnectTimerRef = useRef<number | null>(null);
+  const pollTimerRef = useRef<number | null>(null);
   const attemptRef = useRef(0);
   const latestRef = useRef<MetadataPayload | null>(null);
   const onMessageRef = useRef(onMessage);
@@ -142,6 +153,58 @@ export function useRealtime(options: UseRealtimeOptions): UseRealtimeResult {
       }
     };
 
+    const clearTimers = () => {
+      if (reconnectTimerRef.current !== null) {
+        window.clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
+      if (pollTimerRef.current !== null) {
+        window.clearTimeout(pollTimerRef.current);
+        pollTimerRef.current = null;
+      }
+    };
+
+    const publishPayload = (payload: MetadataPayload) => {
+      latestRef.current = payload;
+      onMessageRef.current?.(payload);
+    };
+
+    const fetchLatest = async () => {
+      if (!latestUrl || cancelled) {
+        return;
+      }
+      try {
+        const response = await fetch(latestUrl, { method: "GET", headers });
+        if (!response.ok) {
+          return;
+        }
+        const parsed = normalizePayload((await response.json()) as unknown);
+        if (parsed && !cancelled) {
+          publishPayload(parsed);
+        }
+      } catch {
+        // Keep websocket reconnect loop as primary transport.
+      }
+    };
+
+    const scheduleMetadataPoll = () => {
+      if (!latestUrl || cancelled) {
+        return;
+      }
+      const interval = Math.max(80, Number.isFinite(pollIntervalMs) ? Math.round(pollIntervalMs) : 250);
+      const tick = () => {
+        if (cancelled) {
+          return;
+        }
+        const isOpen = wsRef.current?.readyState === WebSocket.OPEN;
+        if (!isOpen) {
+          void fetchLatest();
+        }
+        pollTimerRef.current = window.setTimeout(tick, interval);
+      };
+      pollTimerRef.current = window.setTimeout(tick, 0);
+    };
+
     const scheduleReconnect = () => {
       if (cancelled) {
         return;
@@ -150,7 +213,7 @@ export function useRealtime(options: UseRealtimeOptions): UseRealtimeResult {
       const delay = RECONNECT_DELAYS_MS[idx];
       attemptRef.current += 1;
       setRetryAttempt(attemptRef.current);
-      timerRef.current = window.setTimeout(connect, delay);
+      reconnectTimerRef.current = window.setTimeout(connect, delay);
     };
 
     const connect = () => {
@@ -180,8 +243,7 @@ export function useRealtime(options: UseRealtimeOptions): UseRealtimeResult {
         if (!parsed) {
           return;
         }
-        latestRef.current = parsed;
-        onMessageRef.current?.(parsed);
+        publishPayload(parsed);
       };
 
       wsRef.current.onerror = () => {
@@ -195,16 +257,16 @@ export function useRealtime(options: UseRealtimeOptions): UseRealtimeResult {
       };
     };
 
+    scheduleMetadataPoll();
+    void fetchLatest();
     connect();
 
     return () => {
       cancelled = true;
-      if (timerRef.current !== null) {
-        window.clearTimeout(timerRef.current);
-      }
+      clearTimers();
       cleanupSocket();
     };
-  }, [enabled, url]);
+  }, [enabled, headers, latestUrl, pollIntervalMs, url]);
 
   return { status, error, retryAttempt, latestRef };
 }

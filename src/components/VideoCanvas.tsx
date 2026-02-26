@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
   postWebRtcOffer,
+  resolveMetadataLatestUrl,
   resolveMetadataWsUrl,
   withApiKeyHeaders,
   withApiKeyQuery,
@@ -16,13 +17,17 @@ interface VideoCanvasProps {
   pixelPerfect?: boolean;
   focusedTrackId?: number | null;
   metadataUrl?: string;
+  metadataLatestUrl?: string;
   janusHttpUrl?: string;
   janusMountpoint?: number;
+  directStreamUrl?: string;
+  directStreamKind?: "auto" | "video" | "image";
+  disableBackendVideo?: boolean;
   onTrackFocus?: (track: TrackPayload | null) => void;
   onRosterChange?: (tracks: TrackPayload[]) => void;
 }
 
-type TransportMode = "connecting" | "janus" | "webrtc" | "mjpeg" | "error";
+type TransportMode = "connecting" | "direct" | "janus" | "webrtc" | "mjpeg" | "error";
 
 interface ProjectedTrack {
   track: TrackPayload;
@@ -49,6 +54,8 @@ interface RosterEmitCache {
   key: string;
   at: number;
 }
+
+type DirectStreamKind = "auto" | "video" | "image";
 
 const THUMB_SIZE = 34;
 
@@ -132,6 +139,22 @@ function computeRosterKey(tracks: TrackPayload[]): string {
     .join("|");
 }
 
+function inferDirectStreamKind(url: string, explicit: DirectStreamKind): "video" | "image" {
+  if (explicit === "video" || explicit === "image") {
+    return explicit;
+  }
+  const normalized = url.toLowerCase();
+  if (
+    normalized.includes(".mjpg") ||
+    normalized.includes(".mjpeg") ||
+    normalized.includes("/mjpeg") ||
+    normalized.includes("multipart/x-mixed-replace")
+  ) {
+    return "image";
+  }
+  return "video";
+}
+
 async function waitForIceGatheringComplete(pc: RTCPeerConnection, timeoutMs = 2000): Promise<void> {
   if (pc.iceGatheringState === "complete") {
     return;
@@ -158,8 +181,12 @@ export function VideoCanvas({
   pixelPerfect = true,
   focusedTrackId = null,
   metadataUrl,
+  metadataLatestUrl,
   janusHttpUrl = API.JANUS_HTTP,
   janusMountpoint = API.JANUS_MOUNTPOINT,
+  directStreamUrl = API.DIRECT_STREAM_URL,
+  directStreamKind = API.DIRECT_STREAM_KIND as DirectStreamKind,
+  disableBackendVideo = API.DISABLE_BACKEND_VIDEO,
   onTrackFocus,
   onRosterChange
 }: VideoCanvasProps): JSX.Element {
@@ -167,12 +194,27 @@ export function VideoCanvas({
     () => withApiKeyQuery(metadataUrl ?? resolveMetadataWsUrl()),
     [metadataUrl]
   );
+  const resolvedLatestMetadataUrl = useMemo(
+    () => withApiKeyQuery(metadataLatestUrl ?? resolveMetadataLatestUrl()),
+    [metadataLatestUrl]
+  );
   const resolvedJanusHttpUrl = useMemo(() => resolveApiUrl(janusHttpUrl).replace(/\/+$/, ""), [janusHttpUrl]);
   const resolvedMjpegUrl = useMemo(() => withApiKeyQuery(resolveApiUrl("/api/media/mjpeg")), []);
+  const resolvedDirectStreamUrl = useMemo(
+    () => (directStreamUrl ? withApiKeyQuery(resolveApiUrl(directStreamUrl)) : ""),
+    [directStreamUrl]
+  );
+  const resolvedDirectStreamKind = useMemo<DirectStreamKind>(() => {
+    if (directStreamKind === "image" || directStreamKind === "video") {
+      return directStreamKind;
+    }
+    return "auto";
+  }, [directStreamKind]);
   const resolvedJanusMountpoint = useMemo(
     () => (Number.isFinite(janusMountpoint) && Number(janusMountpoint) > 0 ? Number(janusMountpoint) : 1),
     [janusMountpoint]
   );
+  const authHeaders = useMemo(() => withApiKeyHeaders(), []);
   const disableWebRtc = (import.meta.env.VITE_DISABLE_WEBRTC as string | undefined) === "true";
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -199,6 +241,9 @@ export function VideoCanvas({
 
   const realtime = useRealtime({
     url: resolvedWsUrl,
+    latestUrl: resolvedLatestMetadataUrl,
+    pollIntervalMs: API.METADATA_POLL_MS,
+    headers: authHeaders,
     enabled: active,
     onMessage: (payload) => {
       const resolvedTracks = payload.tracks.map((track) => ({
@@ -243,6 +288,8 @@ export function VideoCanvas({
     }
     const video = videoRef.current;
     if (video) {
+      video.onloadeddata = null;
+      video.onerror = null;
       video.pause();
       video.srcObject = null;
       video.removeAttribute("src");
@@ -290,6 +337,8 @@ export function VideoCanvas({
 
     const hideMjpeg = () => {
       mjpeg.style.display = "none";
+      mjpeg.onload = null;
+      mjpeg.onerror = null;
       mjpeg.removeAttribute("src");
     };
     const showVideo = () => {
@@ -303,6 +352,82 @@ export function VideoCanvas({
       video.style.display = "none";
       mjpeg.style.display = "block";
       mjpeg.src = url;
+    };
+
+    const startDirectStreamTransport = async (): Promise<{ ok: boolean; error: string }> => {
+      if (!resolvedDirectStreamUrl) {
+        return { ok: false, error: "No direct stream URL configured" };
+      }
+      const inferredKind = inferDirectStreamKind(resolvedDirectStreamUrl, resolvedDirectStreamKind);
+      if (inferredKind === "image") {
+        const loaded = await new Promise<boolean>((resolve) => {
+          const timeout = window.setTimeout(() => {
+            mjpeg.onload = null;
+            mjpeg.onerror = null;
+            resolve(false);
+          }, 5000);
+          mjpeg.onload = () => {
+            window.clearTimeout(timeout);
+            mjpeg.onload = null;
+            mjpeg.onerror = null;
+            resolve(true);
+          };
+          mjpeg.onerror = () => {
+            window.clearTimeout(timeout);
+            mjpeg.onload = null;
+            mjpeg.onerror = null;
+            resolve(false);
+          };
+          showMjpeg(resolvedDirectStreamUrl);
+        });
+        if (!loaded) {
+          hideMjpeg();
+          return { ok: false, error: "Direct image stream did not start" };
+        }
+        transportModeRef.current = "direct";
+        setTransportMode("direct");
+        setTransportError(null);
+        return { ok: true, error: "" };
+      }
+
+      hideMjpeg();
+      video.pause();
+      video.srcObject = null;
+      video.removeAttribute("src");
+      video.style.display = "block";
+      const loaded = await new Promise<boolean>((resolve) => {
+        const timeout = window.setTimeout(() => {
+          video.onloadeddata = null;
+          video.onerror = null;
+          resolve(false);
+        }, 6000);
+        video.onloadeddata = () => {
+          window.clearTimeout(timeout);
+          video.onloadeddata = null;
+          video.onerror = null;
+          resolve(true);
+        };
+        video.onerror = () => {
+          window.clearTimeout(timeout);
+          video.onloadeddata = null;
+          video.onerror = null;
+          resolve(false);
+        };
+        video.src = resolvedDirectStreamUrl;
+        void video.play().catch(() => undefined);
+      });
+      if (!loaded) {
+        video.pause();
+        video.removeAttribute("src");
+        const hint = /^rtsp:\/\//i.test(resolvedDirectStreamUrl)
+          ? "Browser cannot decode raw RTSP. Use Janus/HLS gateway URL."
+          : "Direct video stream did not start";
+        return { ok: false, error: hint };
+      }
+      transportModeRef.current = "direct";
+      setTransportMode("direct");
+      setTransportError(null);
+      return { ok: true, error: "" };
     };
 
     const janusPost = async (
@@ -589,6 +714,16 @@ export function VideoCanvas({
       setTransportMode("connecting");
 
       const failures: string[] = [];
+      if (resolvedDirectStreamUrl) {
+        const directReady = await startDirectStreamTransport();
+        if (cancelled) {
+          return;
+        }
+        if (directReady.ok) {
+          return;
+        }
+        failures.push(`Direct stream: ${directReady.error}`);
+      }
       if (!disableWebRtc) {
         const janusReady = await startJanusTransport();
         if (cancelled) {
@@ -599,18 +734,29 @@ export function VideoCanvas({
         }
         failures.push(`Janus: ${janusReady.error}`);
 
-        const apiWebRtcReady = await startApiWebRtcTransport();
-        if (cancelled) {
-          return;
+        if (!disableBackendVideo) {
+          const apiWebRtcReady = await startApiWebRtcTransport();
+          if (cancelled) {
+            return;
+          }
+          if (apiWebRtcReady.ok) {
+            return;
+          }
+          failures.push(`API WebRTC: ${apiWebRtcReady.error}`);
+        } else {
+          failures.push("API WebRTC disabled by VITE_DISABLE_BACKEND_VIDEO=true");
         }
-        if (apiWebRtcReady.ok) {
-          return;
-        }
-        failures.push(`API WebRTC: ${apiWebRtcReady.error}`);
       } else {
         failures.push("WebRTC disabled by VITE_DISABLE_WEBRTC=true");
       }
 
+      if (disableBackendVideo) {
+        failures.push("MJPEG disabled by VITE_DISABLE_BACKEND_VIDEO=true");
+        transportModeRef.current = "error";
+        setTransportMode("error");
+        setTransportError(failures.join(" | "));
+        return;
+      }
       const mjpegReady = await startMjpegTransport();
       if (cancelled) {
         return;
@@ -630,7 +776,16 @@ export function VideoCanvas({
       cancelled = true;
       closeTransport();
     };
-  }, [active, disableWebRtc, resolvedJanusHttpUrl, resolvedJanusMountpoint, resolvedMjpegUrl]);
+  }, [
+    active,
+    disableBackendVideo,
+    disableWebRtc,
+    resolvedDirectStreamKind,
+    resolvedDirectStreamUrl,
+    resolvedJanusHttpUrl,
+    resolvedJanusMountpoint,
+    resolvedMjpegUrl
+  ]);
 
   useEffect(() => {
     if (!active) {
@@ -642,7 +797,7 @@ export function VideoCanvas({
 
     const pollHealth = async () => {
       try {
-        const response = await fetch(healthUrl, { method: "GET", headers: withApiKeyHeaders() });
+        const response = await fetch(healthUrl, { method: "GET", headers: authHeaders });
         if (!response.ok) {
           return;
         }
@@ -664,7 +819,7 @@ export function VideoCanvas({
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [active]);
+  }, [active, authHeaders]);
 
   useEffect(() => {
     if (!active) {

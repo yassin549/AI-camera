@@ -19,6 +19,9 @@ describe("api client split deployment behavior", () => {
     expect(client.resolveMetadataWsUrl()).toBe(
       "wss://api.example.com/api/realtime/ws?api_key=topsecret"
     );
+    expect(client.resolveMetadataLatestUrl()).toBe(
+      "https://api.example.com/api/realtime/latest?api_key=topsecret"
+    );
   });
 
   test("sends x-api-key header and resolves media URLs against remote API base", async () => {

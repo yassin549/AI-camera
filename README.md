@@ -57,10 +57,19 @@ npm run dev
 - `VITE_API_BASE` default: `http://localhost:8080`
 - `VITE_API_KEY` optional shared key sent as `x-api-key` (HTTP) and `api_key` (WS/media query)
 - `VITE_WS_METADATA_URL` default: `ws://localhost:8080/api/realtime/ws`
+- `VITE_METADATA_LATEST_URL` default: `${VITE_API_BASE}/api/realtime/latest` (used for fast bootstrap/fallback when WS reconnects)
+- `VITE_METADATA_POLL_MS` default: `250` (poll cadence used only when WS is not open)
 - `VITE_WEBRTC_OFFER` default: `http://localhost:8080/webrtc/offer`
 - `VITE_JANUS_HTTP_URL` default: `http://localhost:8088/janus`
 - `VITE_JANUS_MOUNTPOINT` default: `1`
+- `VITE_DIRECT_STREAM_URL` optional direct media URL (for example camera MJPEG, HLS, or WebRTC gateway URL)
+- `VITE_DIRECT_STREAM_KIND` one of `auto|video|image` (default `auto`)
+- `VITE_DISABLE_BACKEND_VIDEO=true` blocks API WebRTC/MJPEG fallbacks so media does not relay through backend
 - `VITE_DISABLE_WEBRTC=true` skips Janus/API WebRTC and uses MJPEG fallback only.
+
+Important:
+- Standard web browsers do not decode raw `rtsp://` URLs directly.
+- For RTSP cameras, use Janus (or another RTSP->WebRTC/HLS gateway) and point frontend to that gateway URL.
 
 ## Backend environment (optional)
 - `API_KEY` enables shared-key protection for identities/realtime/media/WebRTC endpoints.
@@ -74,6 +83,12 @@ Target topology:
 - Frontend (Vite/React) is deployed on Vercel.
 - Backend (FastAPI + CV pipeline) stays local.
 - Browser calls backend through a public tunnel endpoint.
+
+Quick runbook:
+- `docs/PRODUCTION_TODAY.md`
+- `docs/SETUP_FRONTEND_BACKEND_STEP_BY_STEP.md`
+- `.env.vercel.example`
+- `.env.backend.local.example`
 
 ### 1) Start backend locally
 ```bash
@@ -116,10 +131,20 @@ VITE_API_KEY=your-shared-secret
 Optional overrides:
 ```bash
 VITE_WS_METADATA_URL=wss://your-public-backend.example.com/api/realtime/ws
+VITE_METADATA_LATEST_URL=https://your-public-backend.example.com/api/realtime/latest
+VITE_METADATA_POLL_MS=250
 VITE_WEBRTC_OFFER=https://your-public-backend.example.com/webrtc/offer
 VITE_JANUS_HTTP_URL=https://your-janus-endpoint.example.com/janus
 VITE_JANUS_MOUNTPOINT=1
+VITE_DIRECT_STREAM_URL=
+VITE_DIRECT_STREAM_KIND=auto
+VITE_DISABLE_BACKEND_VIDEO=true
 ```
+
+Notes for media routing:
+- Keep `VITE_DISABLE_BACKEND_VIDEO=true` when you want video to stay gateway/direct only.
+- If you provide `VITE_DIRECT_STREAM_URL`, frontend tries it first.
+- For RTSP cameras, use a gateway URL (Janus/HLS/WebRTC). Raw `rtsp://` is not browser-safe.
 
 If `VITE_API_KEY` is set, the frontend will:
 - Send `x-api-key` on HTTP requests.

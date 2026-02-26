@@ -1,4 +1,4 @@
-RTSP_URL: "rtsp://username:password@camera-ip:554/stream1"
+RTSP_URL: "rtsp://pyuser:yacine03041973@192.168.1.70:554/stream1"
 cosine_threshold: 0.88
 skip_n: 2
 imgsz: [640, 360]
