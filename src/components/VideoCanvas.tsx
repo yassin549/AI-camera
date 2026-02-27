@@ -251,7 +251,7 @@ export function VideoCanvas({
     onMessage: (payload) => {
       const resolvedTracks = payload.tracks.map((track) => ({
         ...track,
-        thumb: track.thumb ? resolveApiUrl(track.thumb) : undefined
+        thumb: track.thumb ? withApiKeyQuery(resolveApiUrl(track.thumb)) : undefined
       }));
       const resolvedPayload: MetadataPayload = {
         ...payload,

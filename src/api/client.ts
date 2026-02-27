@@ -190,10 +190,10 @@ function coerceStringArray(input: unknown): string[] {
     return input
       .map((entry) => asString(entry))
       .filter((entry): entry is string => Boolean(entry))
-      .map((entry) => toMediaUrl(entry));
+      .map((entry) => withApiKeyQuery(toMediaUrl(entry)));
   }
   const single = asString(input);
-  return single ? [toMediaUrl(single)] : [];
+  return single ? [withApiKeyQuery(toMediaUrl(single))] : [];
 }
 
 function normalizeIdentity(raw: unknown): IdentitySummary {
