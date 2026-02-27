@@ -27,6 +27,7 @@ if _cors_from_env:
     CORS_ORIGINS: List[str] = [item.strip() for item in _cors_from_env.split(",") if item.strip()]
 else:
     CORS_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
+CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
 
 API_KEY = os.getenv("API_KEY", "").strip() or None
 DELETE_SAMPLE_FILES = os.getenv("AICAM_DELETE_SAMPLE_FILES", "0").strip().lower() in {

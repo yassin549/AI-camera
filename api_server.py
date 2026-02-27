@@ -24,6 +24,7 @@ from config import (
     APP_NAME,
     APP_VERSION,
     CORS_ORIGINS,
+    CORS_ORIGIN_REGEX,
     ENABLE_FRAME_STREAMING,
     HEALTH_FRAME_STALE_SEC,
     MJPEG_JPEG_QUALITY,
@@ -421,6 +422,7 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
     app.add_middleware(
         CORSMiddleware,
         allow_origins=CORS_ORIGINS,
+        allow_origin_regex=CORS_ORIGIN_REGEX,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
