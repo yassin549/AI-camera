@@ -9,4 +9,12 @@ if [[ ! -x "$PYTHON_EXE" ]]; then
   exit 1
 fi
 
+ENV_FILE="$ROOT_DIR/.env.backend.local"
+if [[ -f "$ENV_FILE" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$ENV_FILE"
+  set +a
+fi
+
 "$PYTHON_EXE" main.py --config config.yaml --start-api --no-display "$@"
