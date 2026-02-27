@@ -27,10 +27,22 @@ Live video transport order is:
 ```bash
 docker compose up -d janus
 ```
+If you want Docker-managed camera ingest (no local ffmpeg install), set `JANUS_RTSP_URL` in `.env` and run:
+```bash
+docker compose --profile ingest up -d janus ffmpeg-relay
+```
 
 2. Configure Janus mountpoint:
 - Edit `janus/etc/janus/streaming.jcfg`.
-- Set camera URL and password in `url = "rtsp://..."`.
+- Keep mountpoint `id = 1` (default in this repo).
+- Start FFmpeg RTP push into Janus from your RTSP camera:
+```bash
+scripts/ffmpeg-push.sh "rtsp://USER:PASS@CAMERA_IP:554/your-path"
+```
+Windows:
+```powershell
+scripts\ffmpeg-push.bat "rtsp://USER:PASS@CAMERA_IP:554/your-path"
+```
 
 3. Start Python backend:
 ```bash
@@ -92,23 +104,24 @@ Quick runbook:
 
 ### 1) Start backend locally
 ```bash
-python main.py --config config.yaml --start-api
+./run_prod.sh
+# Windows:
+# run_prod.bat
 ```
 
 ### 2) Expose backend with a tunnel
-Recommended options:
+Recommended: named Cloudflare Tunnel (persistent hostname):
 
-Cloudflare Tunnel (quick temporary URL):
 ```bash
-cloudflared tunnel --url http://localhost:8080
+cloudflared tunnel login
+cloudflared tunnel create aicam
+cloudflared tunnel route dns aicam api.your-domain.example.com
+cloudflared tunnel route dns aicam janus-api.your-domain.example.com
+# then copy cloudflared/config.yml.example -> cloudflared/config.yml
+# and run scripts/run-tunnel.sh (or scripts\run-tunnel.bat on Windows)
 ```
 
-Tailscale Funnel:
-```bash
-tailscale funnel 8080
-```
-
-Use the produced public HTTPS URL as your backend base (for example `https://xxxx.trycloudflare.com`).
+Use `https://api.your-domain.example.com` as your backend base.
 
 ### 3) Backend env vars (local machine)
 Set these before starting Python:
@@ -124,27 +137,29 @@ Notes:
 ### 4) Vercel env vars (frontend project)
 Set in Vercel Project Settings -> Environment Variables:
 ```bash
-VITE_API_BASE=https://your-public-backend.example.com
+VITE_API_BASE=https://api.your-domain.example.com
 VITE_API_KEY=your-shared-secret
 ```
 
 Optional overrides:
 ```bash
-VITE_WS_METADATA_URL=wss://your-public-backend.example.com/api/realtime/ws
-VITE_METADATA_LATEST_URL=https://your-public-backend.example.com/api/realtime/latest
+VITE_WS_METADATA_URL=wss://api.your-domain.example.com/api/realtime/ws
+VITE_METADATA_LATEST_URL=https://api.your-domain.example.com/api/realtime/latest
 VITE_METADATA_POLL_MS=250
-VITE_WEBRTC_OFFER=https://your-public-backend.example.com/webrtc/offer
-VITE_JANUS_HTTP_URL=https://your-janus-endpoint.example.com/janus
+VITE_WEBRTC_OFFER=https://api.your-domain.example.com/webrtc/offer
+VITE_JANUS_HTTP_URL=https://janus-api.your-domain.example.com/janus
 VITE_JANUS_MOUNTPOINT=1
 VITE_DIRECT_STREAM_URL=
 VITE_DIRECT_STREAM_KIND=auto
 VITE_DISABLE_BACKEND_VIDEO=true
+VITE_DISABLE_WEBRTC=false
 ```
 
 Notes for media routing:
 - Keep `VITE_DISABLE_BACKEND_VIDEO=true` when you want video to stay gateway/direct only.
 - If you provide `VITE_DIRECT_STREAM_URL`, frontend tries it first.
 - For RTSP cameras, use a gateway URL (Janus/HLS/WebRTC). Raw `rtsp://` is not browser-safe.
+- Cloudflare HTTP tunnel exposes Janus signaling only; remote WebRTC media still needs reachable ICE candidates (STUN/TURN + UDP).
 
 If `VITE_API_KEY` is set, the frontend will:
 - Send `x-api-key` on HTTP requests.
@@ -241,4 +256,5 @@ async function startJanus(videoEl) {
 - No Janus video: verify `VITE_JANUS_HTTP_URL` and `VITE_JANUS_MOUNTPOINT`; UI should still fall back automatically.
 - No overlay: verify metadata WS at `/api/realtime/ws`.
 - High backend CPU: verify Janus is ingesting a direct H264 stream (`-c copy`) and avoid re-encode hops.
-- Camera pull issues in Janus: use `scripts/ffmpeg-push.sh` with `-c copy` and ingest via your gateway path.
+- Janus mountpoint/auth issues: run `python tools/check_janus_mountpoint.py` and inspect `docker compose logs janus`.
+- Camera ingest issues: run `scripts/ffmpeg-push.sh` (or `scripts\ffmpeg-push.bat`) with `-c copy` to feed Janus RTP.

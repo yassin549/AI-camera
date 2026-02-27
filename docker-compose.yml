@@ -13,3 +13,17 @@ services:
       - ./janus/etc/janus/streaming.jcfg:/usr/local/etc/janus/janus.plugin.streaming.jcfg:ro
     environment:
       - TZ=UTC
+
+  ffmpeg-relay:
+    image: jrottenberg/ffmpeg:6.0-alpine
+    container_name: aicam-ffmpeg-relay
+    restart: unless-stopped
+    depends_on:
+      - janus
+    profiles:
+      - ingest
+    environment:
+      - JANUS_RTSP_URL=${JANUS_RTSP_URL:-}
+    entrypoint: ["/bin/sh", "-lc"]
+    command:
+      - 'if [ -z "$$JANUS_RTSP_URL" ]; then echo "JANUS_RTSP_URL is required (set it in .env)"; exit 1; fi; exec ffmpeg -nostdin -rtsp_transport tcp -fflags nobuffer -flags low_delay -i "$$JANUS_RTSP_URL" -an -c:v copy -payload_type 96 -f rtp "rtp://janus:5004?pkt_size=1200"'

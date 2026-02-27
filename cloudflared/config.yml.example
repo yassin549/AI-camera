@@ -1,0 +1,14 @@
+tunnel: YOUR_TUNNEL_UUID
+credentials-file: C:\Users\YOUR_USER\.cloudflared\YOUR_TUNNEL_UUID.json
+
+ingress:
+  # Backend API + metadata websocket
+  - hostname: api.your-domain.example.com
+    service: http://localhost:8080
+
+  # Janus HTTP signaling endpoint (frontend uses this URL + /janus)
+  - hostname: janus-api.your-domain.example.com
+    service: http://localhost:8088
+
+  - service: http_status:404
+
