@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
 from api.identities import router as identities_router
+from api.janus_proxy import router as janus_proxy_router
 from api.media import mount_static_media, router as media_router
 from api.realtime import AIORTC_AVAILABLE, router as realtime_router
 from config import (
@@ -428,6 +429,7 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
         allow_headers=["*"],
     )
 
+    app.include_router(janus_proxy_router, tags=["janus"])
     app.include_router(identities_router, prefix="/api/identities", tags=["identities"])
     app.include_router(media_router, tags=["media"])
     app.include_router(realtime_router, tags=["realtime"])
@@ -452,6 +454,7 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
                 "/api/identities/{id}",
                 "/api/realtime/ws",
                 "/webrtc/offer",
+                "/janus",
             ],
         }
         if not AIORTC_AVAILABLE:

@@ -128,6 +128,7 @@ Set these before starting Python:
 ```bash
 API_KEY=your-shared-secret
 CORS_ORIGINS=https://your-app.vercel.app,http://localhost:5173,http://127.0.0.1:5173
+AICAM_JANUS_UPSTREAM=http://127.0.0.1:8088/janus
 ```
 
 Notes:
@@ -149,6 +150,7 @@ VITE_METADATA_POLL_MS=250
 VITE_WEBRTC_OFFER=https://api.your-domain.example.com/webrtc/offer
 VITE_JANUS_HTTP_URL=https://janus-api.your-domain.example.com/janus
 VITE_JANUS_MOUNTPOINT=1
+VITE_DISABLE_JANUS=false
 VITE_DIRECT_STREAM_URL=
 VITE_DIRECT_STREAM_KIND=auto
 VITE_DISABLE_BACKEND_VIDEO=true
@@ -160,6 +162,12 @@ Notes for media routing:
 - If you provide `VITE_DIRECT_STREAM_URL`, frontend tries it first.
 - For RTSP cameras, use a gateway URL (Janus/HLS/WebRTC). Raw `rtsp://` is not browser-safe.
 - Cloudflare HTTP tunnel exposes Janus signaling only; remote WebRTC media still needs reachable ICE candidates (STUN/TURN + UDP).
+
+Single-domain ngrok mode (free plan):
+- Point `VITE_API_BASE` to your single `https://*.ngrok-free.dev` tunnel on backend `:8080`.
+- Keep `VITE_JANUS_HTTP_URL=/janus` so the frontend uses backend Janus proxy on the same domain.
+- Keep `AICAM_JANUS_UPSTREAM=http://127.0.0.1:8088/janus` on backend.
+- Recommended for stability: `VITE_DISABLE_BACKEND_VIDEO=true` (Janus-only media path).
 
 If `VITE_API_KEY` is set, the frontend will:
 - Send `x-api-key` on HTTP requests.

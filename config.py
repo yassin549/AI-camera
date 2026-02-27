@@ -30,6 +30,8 @@ else:
 CORS_ORIGIN_REGEX = os.getenv("CORS_ORIGIN_REGEX", "").strip() or None
 
 API_KEY = os.getenv("API_KEY", "").strip() or None
+_janus_upstream = os.getenv("AICAM_JANUS_UPSTREAM", "http://127.0.0.1:8088/janus").strip()
+JANUS_UPSTREAM_URL = (_janus_upstream or "http://127.0.0.1:8088/janus").rstrip("/")
 DELETE_SAMPLE_FILES = os.getenv("AICAM_DELETE_SAMPLE_FILES", "0").strip().lower() in {
     "1",
     "true",

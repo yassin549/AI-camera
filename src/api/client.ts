@@ -83,6 +83,15 @@ function getApiKey(): string | null {
   return normalized.length > 0 ? normalized : null;
 }
 
+function isNgrokFreeDomain(url: string): boolean {
+  try {
+    const host = new URL(url).hostname.toLowerCase();
+    return host.endsWith(".ngrok-free.app") || host.endsWith(".ngrok-free.dev");
+  } catch {
+    return false;
+  }
+}
+
 function appendQueryParam(url: string, key: string, value: string): string {
   try {
     const parsed = new URL(url);
@@ -115,6 +124,9 @@ export function withApiKeyHeaders(input?: HeadersInit): Headers {
   const key = getApiKey();
   if (key && !headers.has("x-api-key")) {
     headers.set("x-api-key", key);
+  }
+  if (isNgrokFreeDomain(API.REST_BASE) && !headers.has("ngrok-skip-browser-warning")) {
+    headers.set("ngrok-skip-browser-warning", "1");
   }
   return headers;
 }

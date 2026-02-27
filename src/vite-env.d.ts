@@ -10,6 +10,7 @@ interface ImportMetaEnv {
   readonly VITE_DIRECT_STREAM_URL?: string;
   readonly VITE_DIRECT_STREAM_KIND?: string;
   readonly VITE_DISABLE_BACKEND_VIDEO?: string;
+  readonly VITE_DISABLE_JANUS?: string;
   readonly VITE_METADATA_LATEST_URL?: string;
   readonly VITE_METADATA_POLL_MS?: string;
   readonly VITE_USE_MOCK?: string;

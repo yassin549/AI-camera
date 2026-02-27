@@ -58,6 +58,9 @@ const directStreamKind = (
 const disableBackendVideo = asBool(
   readEnv("VITE_DISABLE_BACKEND_VIDEO", "REACT_APP_DISABLE_BACKEND_VIDEO")
 );
+const disableJanus = asBool(
+  readEnv("VITE_DISABLE_JANUS", "REACT_APP_DISABLE_JANUS")
+);
 const metadataLatest =
   readEnv("VITE_METADATA_LATEST_URL", "REACT_APP_METADATA_LATEST_URL") ??
   `${normalizedRestBase}/api/realtime/latest`;
@@ -75,6 +78,7 @@ export const API = {
   DIRECT_STREAM_URL: directStreamUrl ?? "",
   DIRECT_STREAM_KIND:
     directStreamKind === "image" || directStreamKind === "video" ? directStreamKind : "auto",
+  DISABLE_JANUS: disableJanus,
   DISABLE_BACKEND_VIDEO: disableBackendVideo,
   METADATA_LATEST: metadataLatest,
   METADATA_POLL_MS: metadataPollMs,

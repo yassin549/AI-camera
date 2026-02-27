@@ -23,6 +23,7 @@ interface VideoCanvasProps {
   directStreamUrl?: string;
   directStreamKind?: "auto" | "video" | "image";
   disableBackendVideo?: boolean;
+  disableJanus?: boolean;
   onTrackFocus?: (track: TrackPayload | null) => void;
   onRosterChange?: (tracks: TrackPayload[]) => void;
 }
@@ -187,6 +188,7 @@ export function VideoCanvas({
   directStreamUrl = API.DIRECT_STREAM_URL,
   directStreamKind = API.DIRECT_STREAM_KIND as DirectStreamKind,
   disableBackendVideo = API.DISABLE_BACKEND_VIDEO,
+  disableJanus = API.DISABLE_JANUS,
   onTrackFocus,
   onRosterChange
 }: VideoCanvasProps): JSX.Element {
@@ -229,6 +231,7 @@ export function VideoCanvas({
   const resizeKeyRef = useRef(0);
   const rafRef = useRef<number | null>(null);
   const janusPcRef = useRef<RTCPeerConnection | null>(null);
+  const apiWebRtcPcRef = useRef<RTCPeerConnection | null>(null);
   const janusAbortRef = useRef<AbortController | null>(null);
   const janusSessionRef = useRef<number | null>(null);
   const janusHandleRef = useRef<number | null>(null);
@@ -277,14 +280,21 @@ export function VideoCanvas({
       abort.abort();
       janusAbortRef.current = null;
     }
-    const pc = janusPcRef.current;
-    if (!pc) {
+    const janusPc = janusPcRef.current;
+    if (!janusPc) {
       // continue: session may still need cleanup.
     } else {
-      pc.ontrack = null;
-      pc.onicecandidate = null;
-      pc.close();
+      janusPc.ontrack = null;
+      janusPc.onicecandidate = null;
+      janusPc.close();
       janusPcRef.current = null;
+    }
+    const apiWebRtcPc = apiWebRtcPcRef.current;
+    if (apiWebRtcPc) {
+      apiWebRtcPc.ontrack = null;
+      apiWebRtcPc.onicecandidate = null;
+      apiWebRtcPc.close();
+      apiWebRtcPcRef.current = null;
     }
     const video = videoRef.current;
     if (video) {
@@ -313,9 +323,11 @@ export function VideoCanvas({
       janus: "destroy",
       transaction: nextTx(),
     };
+    const destroyHeaders = withApiKeyHeaders();
+    destroyHeaders.set("Content-Type", "application/json");
     void fetch(`${resolvedJanusHttpUrl}/${sessionId}`, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: destroyHeaders,
       body: JSON.stringify(payload),
     }).catch(() => undefined);
   };
@@ -435,9 +447,11 @@ export function VideoCanvas({
       body: Record<string, unknown>,
       signal: AbortSignal
     ): Promise<Record<string, unknown>> => {
+      const headers = withApiKeyHeaders();
+      headers.set("Content-Type", "application/json");
       const response = await fetch(`${resolvedJanusHttpUrl}${path}`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers,
         body: JSON.stringify({ ...body, transaction: nextTx() }),
         signal,
       });
@@ -531,7 +545,7 @@ export function VideoCanvas({
             const rid = Date.now();
             const response = await fetch(
               `${resolvedJanusHttpUrl}/${janusSessionRef.current}?rid=${rid}&maxev=10`,
-              { signal }
+              { signal, headers: authHeaders }
             );
             if (!response.ok) {
               throw new Error(`Janus poll ${response.status}`);
@@ -605,7 +619,7 @@ export function VideoCanvas({
       }
       try {
         const pc = new RTCPeerConnection();
-        janusPcRef.current = pc;
+        apiWebRtcPcRef.current = pc;
         const firstTrack = new Promise<boolean>((resolve) => {
           const timeout = window.setTimeout(() => resolve(false), 7000);
           pc.ontrack = (event) => {
@@ -725,14 +739,18 @@ export function VideoCanvas({
         failures.push(`Direct stream: ${directReady.error}`);
       }
       if (!disableWebRtc) {
-        const janusReady = await startJanusTransport();
-        if (cancelled) {
-          return;
+        if (!disableJanus) {
+          const janusReady = await startJanusTransport();
+          if (cancelled) {
+            return;
+          }
+          if (janusReady.ok) {
+            return;
+          }
+          failures.push(`Janus: ${janusReady.error}`);
+        } else {
+          failures.push("Janus disabled by VITE_DISABLE_JANUS=true");
         }
-        if (janusReady.ok) {
-          return;
-        }
-        failures.push(`Janus: ${janusReady.error}`);
 
         if (!disableBackendVideo) {
           const apiWebRtcReady = await startApiWebRtcTransport();
@@ -779,6 +797,7 @@ export function VideoCanvas({
   }, [
     active,
     disableBackendVideo,
+    disableJanus,
     disableWebRtc,
     resolvedDirectStreamKind,
     resolvedDirectStreamUrl,
