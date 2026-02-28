@@ -9,6 +9,7 @@ import {
   type IdentityDetailData,
   type IdentitySummary
 } from "../api/client";
+import { AuthenticatedImage } from "../components/AuthenticatedImage";
 
 interface DetailRouteState {
   layoutId?: string;
@@ -200,10 +201,20 @@ export function IdentityDetail(): JSX.Element {
                 <div className="text-xs uppercase tracking-[0.14em] text-slate-400">Thumbnails</div>
                 <div className="mt-3 grid grid-cols-2 gap-3">
                   {(detail?.face_samples ?? []).slice(0, 2).map((sample) => (
-                    <img key={sample} src={sample} alt="Face sample" className="h-24 w-full rounded-lg object-cover" />
+                    <AuthenticatedImage
+                      key={sample}
+                      src={sample}
+                      alt="Face sample"
+                      className="h-24 w-full rounded-lg object-cover"
+                    />
                   ))}
                   {(detail?.body_samples ?? []).slice(0, 2).map((sample) => (
-                    <img key={sample} src={sample} alt="Body sample" className="h-24 w-full rounded-lg object-cover" />
+                    <AuthenticatedImage
+                      key={sample}
+                      src={sample}
+                      alt="Body sample"
+                      className="h-24 w-full rounded-lg object-cover"
+                    />
                   ))}
                 </div>
               </div>
@@ -225,7 +236,7 @@ export function IdentityDetail(): JSX.Element {
               <div className="text-xs uppercase tracking-[0.14em] text-slate-400">Sample Carousel</div>
               <div className="mt-3 flex gap-3 overflow-x-auto pb-2">
                 {samples.map((sample) => (
-                  <img
+                  <AuthenticatedImage
                     key={sample}
                     src={sample}
                     alt="Identity sample"

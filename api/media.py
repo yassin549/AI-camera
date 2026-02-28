@@ -129,7 +129,18 @@ async def _stream_wsjpeg_impl(websocket: WebSocket) -> None:
     runtime.register_mjpeg_client()
     LOGGER.info("WS JPEG stream opened from %s", host)
 
-    target_interval = max(1.0 / MJPEG_FPS, 0.005)
+    requested_fps_raw = websocket.query_params.get("fps")
+    requested_fps: float | None = None
+    if requested_fps_raw:
+        try:
+            requested_fps = float(requested_fps_raw)
+        except Exception:
+            requested_fps = None
+    effective_fps = MJPEG_FPS
+    if requested_fps is not None and requested_fps > 0:
+        effective_fps = min(MJPEG_FPS, max(1.0, requested_fps))
+
+    target_interval = max(1.0 / effective_fps, 0.005)
     poll_interval = min(target_interval * 0.5, 0.01)
     last_frame_id = -1
     last_sent_at = 0.0

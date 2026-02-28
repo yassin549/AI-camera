@@ -132,6 +132,15 @@ function toWebSocketUrl(url: string): string {
   }
 }
 
+function isNgrokFreeUrl(input: string): boolean {
+  try {
+    const host = new URL(input, window.location.href).hostname.toLowerCase();
+    return host.endsWith(".ngrok-free.app") || host.endsWith(".ngrok-free.dev");
+  } catch {
+    return false;
+  }
+}
+
 function nextTx(): string {
   return Math.random().toString(36).slice(2, 12);
 }
@@ -218,10 +227,12 @@ export function VideoCanvas({
     [metadataLatestUrl]
   );
   const resolvedJanusHttpUrl = useMemo(() => resolveApiUrl(janusHttpUrl).replace(/\/+$/, ""), [janusHttpUrl]);
-  const resolvedWsJpegUrl = useMemo(
-    () => withApiKeyQuery(toWebSocketUrl(resolveApiUrl("/api/media/ws"))),
-    []
-  );
+  const resolvedWsJpegUrl = useMemo(() => {
+    const base = toWebSocketUrl(resolveApiUrl("/api/media/ws"));
+    const remoteFps = isNgrokFreeUrl(API.REST_BASE) ? 10 : 20;
+    const separator = base.includes("?") ? "&" : "?";
+    return withApiKeyQuery(`${base}${separator}fps=${remoteFps}`);
+  }, []);
   const resolvedMjpegUrl = useMemo(() => withApiKeyQuery(resolveApiUrl("/api/media/mjpeg")), []);
   const resolvedDirectStreamUrl = useMemo(
     () => (directStreamUrl ? withApiKeyQuery(resolveApiUrl(directStreamUrl)) : ""),
@@ -783,6 +794,7 @@ export function VideoCanvas({
           wsJpegSocketRef.current = socket;
           socket.binaryType = "arraybuffer";
           let receivedFrame = false;
+          let lastRenderedAt = 0;
           const timeout = window.setTimeout(() => {
             try {
               socket.close();
@@ -793,6 +805,11 @@ export function VideoCanvas({
           }, 7000);
 
           socket.onmessage = (event) => {
+            const now = performance.now();
+            if (now - lastRenderedAt < 80) {
+              return;
+            }
+            lastRenderedAt = now;
             const blob = event.data instanceof Blob ? event.data : new Blob([event.data], { type: "image/jpeg" });
             const nextUrl = URL.createObjectURL(blob);
             const previousUrl = wsJpegObjectUrlRef.current;

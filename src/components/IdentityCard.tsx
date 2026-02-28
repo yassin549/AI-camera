@@ -1,5 +1,6 @@
 import { motion } from "framer-motion";
 import type { IdentitySummary } from "../api/client";
+import { AuthenticatedImage } from "./AuthenticatedImage";
 
 interface IdentityCardProps {
   identity: IdentitySummary;
@@ -21,7 +22,7 @@ export function IdentityCard({ identity, layoutId, onOpen }: IdentityCardProps):
       data-testid={`identity-card-${identity.id}`}
     >
       {thumb ? (
-        <img
+        <AuthenticatedImage
           src={thumb}
           alt={`Identity ${identity.id}`}
           loading="lazy"
