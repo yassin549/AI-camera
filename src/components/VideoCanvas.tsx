@@ -497,16 +497,22 @@ export function VideoCanvas({
         janusHandleRef.current = handleId;
         const pc = new RTCPeerConnection();
         janusPcRef.current = pc;
-        pc.ontrack = (event) => {
-          if (event.streams[0]) {
+        const firstTrack = new Promise<boolean>((resolve) => {
+          const timeout = window.setTimeout(() => resolve(false), 8000);
+          pc.ontrack = (event) => {
+            if (!event.streams[0]) {
+              return;
+            }
+            window.clearTimeout(timeout);
             showVideo();
             video.srcObject = event.streams[0];
             video.play().catch(() => undefined);
             transportModeRef.current = "janus";
             setTransportMode("janus");
             setTransportError(null);
-          }
-        };
+            resolve(true);
+          };
+        });
         pc.onicecandidate = (event) => {
           const sid = janusSessionRef.current;
           const hid = janusHandleRef.current;
@@ -602,6 +608,10 @@ export function VideoCanvas({
           closeTransport();
         });
 
+        const gotTrack = await firstTrack;
+        if (!gotTrack) {
+          throw new Error("Janus connected but no media track received");
+        }
         return { ok: true, error: "" };
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : "Janus negotiation failed";

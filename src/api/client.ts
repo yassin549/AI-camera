@@ -112,11 +112,18 @@ function appendQueryParam(url: string, key: string, value: string): string {
 }
 
 export function withApiKeyQuery(url: string): string {
-  const key = getApiKey();
-  if (!key || !url) {
+  if (!url) {
     return url;
   }
-  return appendQueryParam(url, "api_key", key);
+  let next = url;
+  const key = getApiKey();
+  if (key) {
+    next = appendQueryParam(next, "api_key", key);
+  }
+  if (isNgrokFreeDomain(next)) {
+    next = appendQueryParam(next, "ngrok-skip-browser-warning", "1");
+  }
+  return next;
 }
 
 export function withApiKeyHeaders(input?: HeadersInit): Headers {

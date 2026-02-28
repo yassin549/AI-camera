@@ -1,268 +1,372 @@
-# AIcam: Janus-first Live Video + Metadata Overlay
+# AIcam: Live Person Tracking + Identity Overlay
 
-AIcam now uses a media-gateway architecture:
-- Browser video path: camera RTSP/H264 -> Janus WebRTC -> `<video>` (hardware decode).
-- Python path: detection/tracking/identity only -> metadata WebSocket (`/api/realtime/ws`).
-- Overlay path: metadata WS -> canvas draw over video.
+AIcam is a local-first computer vision stack for live camera streams:
 
-Live video transport order is:
-1. Janus WebRTC gateway
-2. API WebRTC (`/webrtc/offer`) fallback
-3. MJPEG (`/api/media/mjpeg`) fallback
+- Python backend captures frames, detects/tracks people, and links tracks to identities.
+- FastAPI serves identities, realtime metadata, WebRTC/MJPEG fallbacks, and a Janus proxy.
+- React frontend renders video and draws overlays client-side from metadata.
 
-## Why this architecture
-- Python JPEG/MJPEG encode loops are CPU-heavy and add latency.
-- WS-JPEG full-frame transport is bandwidth-heavy and jittery.
-- Relaying already encoded H264 through WebRTC keeps latency low and CPU usage much lower on i5-class CPUs.
+The key design is to keep **video transport separate from CV metadata** for lower latency and lower CPU.
 
-## Files added for gateway setup
-- `docker-compose.yml`
-- `janus/etc/janus/streaming.jcfg`
-- `janus/test-player.html`
-- `scripts/start-janus.sh`
-- `scripts/ffmpeg-push.sh`
+## How It Works
 
-## Run locally
-1. Start Janus:
+### Runtime pipeline (backend)
+
+`main.py` orchestrates four concurrent parts:
+
+1. **Capture worker** (`capture.py`)
+   - Reads RTSP/video frames via OpenCV.
+   - Keeps only the newest frame in a single-slot buffer (`LatestFrameStore`) to avoid backlog.
+
+2. **Detection + tracking loop** (`detector_yolo.py`, `tracker_adapter.py`)
+   - Runs YOLOv8 ONNX person detection.
+   - Updates track state (ByteTrack when available, fallback IoU tracker otherwise).
+   - Uses adaptive detection interval to maintain target FPS on CPU.
+
+3. **Recognition worker** (`recognition_worker.py`)
+   - Face-first matching (MediaPipe ROI + face embedding + cosine match in SQLite-backed index).
+   - Body fallback matching after repeated face misses (optional).
+   - Creates/updates identities and sample images in `faces/`.
+
+4. **API server thread** (`api_server.py` + `api/*`)
+   - Publishes realtime metadata (`/api/realtime/ws`, `/api/realtime/latest`).
+   - Serves identities (`/api/identities`) and media (`/media/*`).
+   - Offers backend WebRTC fallback (`/webrtc/offer`) and MJPEG (`/api/media/mjpeg`).
+   - Proxies Janus HTTP signaling (`/janus/*`) to upstream Janus.
+
+### Frontend media + metadata model
+
+`src/components/VideoCanvas.tsx` uses independent channels:
+
+- **Video channel** (best-effort fallback order):
+  1. Direct stream URL (if configured)
+  2. Janus WebRTC
+  3. Backend WebRTC (`/webrtc/offer`)
+  4. Backend MJPEG (`/api/media/mjpeg`)
+
+- **Metadata channel**:
+  - Primary: WebSocket `/api/realtime/ws`
+  - Bootstrap/fallback: polling `/api/realtime/latest`
+
+The overlay is always drawn on a `<canvas>` over the video element, so boxes/labels stay responsive even if video source changes.
+
+## Repo Map
+
+Core files you will likely touch first:
+
+- `main.py`: backend orchestrator and CLI entrypoint.
+- `config.yaml`: runtime pipeline config (camera URL, thresholds, FPS, API host/port).
+- `api_server.py`: FastAPI app wiring and shared runtime state.
+- `api/realtime.py`: metadata WS + backend WebRTC offer route.
+- `api/media.py`: MJPEG stream + static media mount.
+- `api/identities.py`: identity CRUD + reindexing.
+- `src/pages/LiveView.tsx`: live UI.
+- `src/components/VideoCanvas.tsx`: transport fallback + overlay drawing.
+- `docker-compose.yml`: Janus gateway + optional FFmpeg relay.
+
+`api.py` exists but is a legacy minimal API path. The active runtime path is `main.py` + `api_server.py`.
+
+## Prerequisites
+
+- Python 3.10+
+- Node.js 18+
+- npm
+- Docker Desktop (optional, for Janus)
+- `ffmpeg` (optional if you use local RTSP->RTP push script)
+
+## Run Locally
+
+### 1) Configure camera source
+
+Edit `config.yaml` and set `rtsp_url` to your camera or stream source.
+
+Minimum keys to verify:
+
+- `rtsp_url`
+- `imgsz`
+- `http_host`
+- `http_port`
+- `db_path`
+
+### 2) Install backend dependencies
+
+Windows PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+Linux/macOS:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
+
+### 3) Optional backend env file (API key, CORS, tuning)
+
+Copy and edit:
+
+- `.env.backend.local.example` -> `.env.backend.local`
+
+If you use `run_prod.bat` / `run_prod.sh`, this env file is loaded automatically.
+
+### 4) Start backend
+
+Recommended (loads `.env.backend.local`, no display window):
+
+Windows:
+
+```powershell
+.\run_prod.bat
+```
+
+Linux/macOS:
+
+```bash
+./run_prod.sh
+```
+
+Alternative direct run:
+
+```bash
+python main.py --config config.yaml --start-api --no-display
+```
+
+### 5) Start frontend
+
+```bash
+npm install
+npm run dev
+```
+
+Open: `http://localhost:5173`
+
+### 6) Quick health checks
+
+```bash
+curl http://127.0.0.1:8080/api/health
+curl http://127.0.0.1:8080/api/realtime/latest
+curl http://127.0.0.1:8080/api/identities
+```
+
+## Janus Setup (Recommended for RTSP Cameras)
+
+Browsers do not play raw `rtsp://` directly. Use Janus (or another gateway) for browser-safe video.
+
+### Start Janus
+
 ```bash
 docker compose up -d janus
-```
-If you want Docker-managed camera ingest (no local ffmpeg install), set `JANUS_RTSP_URL` in `.env` and run:
-```bash
-docker compose --profile ingest up -d janus ffmpeg-relay
+docker compose ps janus
 ```
 
-2. Configure Janus mountpoint:
-- Edit `janus/etc/janus/streaming.jcfg`.
-- Keep mountpoint `id = 1` (default in this repo).
-- Start FFmpeg RTP push into Janus from your RTSP camera:
+### Configure mountpoint
+
+Edit `janus/etc/janus/streaming.jcfg`.
+Default mountpoint in this repo is `id = 1`.
+
+### Push RTSP into Janus
+
+Linux/macOS:
+
 ```bash
 scripts/ffmpeg-push.sh "rtsp://USER:PASS@CAMERA_IP:554/your-path"
 ```
+
 Windows:
+
 ```powershell
 scripts\ffmpeg-push.bat "rtsp://USER:PASS@CAMERA_IP:554/your-path"
 ```
 
-3. Start Python backend:
+Optional Docker-managed ingest (no local ffmpeg install):
+
 ```bash
-python -m venv .venv
-# Linux/macOS:
-source .venv/bin/activate
-# Windows PowerShell:
-# .\.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
-python main.py --config config.yaml --start-api
+docker compose --profile ingest up -d janus ffmpeg-relay
 ```
 
-4. Start frontend:
+Set `JANUS_RTSP_URL` in `.env` first when using this profile.
+
+### Validate Janus signaling/mountpoint
+
 ```bash
-npm i
-npm run dev
+python tools/check_janus_mountpoint.py
 ```
 
-5. Open:
-- `http://localhost:5173`
-- Live page should show `Video: JANUS` in the status badge.
+## Configuration
 
-## Frontend environment (optional)
-- `VITE_API_BASE` default: `http://localhost:8080`
-- `VITE_API_KEY` optional shared key sent as `x-api-key` (HTTP) and `api_key` (WS/media query)
-- `VITE_WS_METADATA_URL` default: `ws://localhost:8080/api/realtime/ws`
-- `VITE_METADATA_LATEST_URL` default: `${VITE_API_BASE}/api/realtime/latest` (used for fast bootstrap/fallback when WS reconnects)
-- `VITE_METADATA_POLL_MS` default: `250` (poll cadence used only when WS is not open)
-- `VITE_WEBRTC_OFFER` default: `http://localhost:8080/webrtc/offer`
-- `VITE_JANUS_HTTP_URL` default: `http://localhost:8088/janus`
-- `VITE_JANUS_MOUNTPOINT` default: `1`
-- `VITE_DIRECT_STREAM_URL` optional direct media URL (for example camera MJPEG, HLS, or WebRTC gateway URL)
-- `VITE_DIRECT_STREAM_KIND` one of `auto|video|image` (default `auto`)
-- `VITE_DISABLE_BACKEND_VIDEO=true` blocks API WebRTC/MJPEG fallbacks so media does not relay through backend
-- `VITE_DISABLE_WEBRTC=true` skips Janus/API WebRTC and uses MJPEG fallback only.
+### `config.yaml` highlights
 
-Important:
-- Standard web browsers do not decode raw `rtsp://` URLs directly.
-- For RTSP cameras, use Janus (or another RTSP->WebRTC/HLS gateway) and point frontend to that gateway URL.
+- `rtsp_url`: input stream URL.
+- `imgsz`: processing resolution used by capture + detector pipeline.
+- `target_fps`: used for adaptive scheduling.
+- `detection_interval`, `detection_interval_max`, `adaptive_detection_interval`.
+- `face_interval_frames`, `body_interval_frames`.
+- `face_threshold`, `body_threshold`.
+- `max_tracks`, `max_track_age_frames`.
+- `http_host`, `http_port`.
+- `yolo_onnx_path`: person detector ONNX path.
 
-## Backend environment (optional)
-- `API_KEY` enables shared-key protection for identities/realtime/media/WebRTC endpoints.
-- `CORS_ORIGINS` comma-separated allowlist used by FastAPI CORS middleware (for example Vercel + localhost).
-- `AICAM_ENABLE_FRAME_STREAMING=1` enables MJPEG fallback endpoints (default enabled).
-- `AICAM_MJPEG_FPS` / `AICAM_MJPEG_QUALITY` tune fallback CPU/bandwidth tradeoffs.
-- `AICAM_CAPTURE_BUFFER=1` keeps capture queue short for lower end-to-end latency.
+### Backend env vars
 
-## Split deployment (Vercel frontend + local backend)
-Target topology:
-- Frontend (Vite/React) is deployed on Vercel.
-- Backend (FastAPI + CV pipeline) stays local.
-- Browser calls backend through a public tunnel endpoint.
+- `API_KEY`: enables auth on identities/realtime/media/janus routes.
+- `CORS_ORIGINS`, `CORS_ORIGIN_REGEX`: browser access control.
+- `AICAM_ENABLE_FRAME_STREAMING`: enables backend WebRTC/MJPEG frame streaming.
+- `AICAM_MJPEG_FPS`, `AICAM_MJPEG_QUALITY`, `AICAM_MJPEG_MAX_CLIENTS`.
+- `AICAM_CAPTURE_BUFFER`: capture queue size (low value reduces latency).
+- `AICAM_WS_HEARTBEAT_SEC`, `AICAM_WS_MAX_CLIENTS`.
+- `AICAM_JANUS_UPSTREAM`: upstream Janus URL for `/janus` proxy.
+- `AICAM_STATIC_PATH`: media root for `/media`.
+- `AICAM_DELETE_SAMPLE_FILES`: delete files on identity delete.
 
-Quick runbook:
-- `docs/PRODUCTION_TODAY.md`
-- `docs/SETUP_FRONTEND_BACKEND_STEP_BY_STEP.md`
-- `.env.vercel.example`
-- `.env.backend.local.example`
+### Frontend env vars
+
+- `VITE_API_BASE`
+- `VITE_API_KEY`
+- `VITE_WS_METADATA_URL`
+- `VITE_METADATA_LATEST_URL`
+- `VITE_METADATA_POLL_MS`
+- `VITE_JANUS_HTTP_URL`
+- `VITE_JANUS_MOUNTPOINT`
+- `VITE_DIRECT_STREAM_URL`
+- `VITE_DIRECT_STREAM_KIND` (`auto|video|image`)
+- `VITE_DISABLE_JANUS`
+- `VITE_DISABLE_BACKEND_VIDEO`
+- `VITE_DISABLE_WEBRTC`
+
+## API Endpoints
+
+- `GET /api/health` (also `/health`, `/healthz`)
+- `GET /metrics`
+- `GET /api/identities`
+- `GET /api/identities/{id}`
+- `POST /api/identities/{id}/rename`
+- `DELETE /api/identities/{id}`
+- `POST /api/identities/reindex`
+- `GET /api/realtime/latest`
+- `WS /api/realtime/ws`
+- `POST /webrtc/offer`
+- `GET /api/media/mjpeg`
+- `GET|POST /janus/*` (reverse proxy)
+
+## Vercel Frontend + ngrok Backend (Required Deployment Mode)
+
+This project supports a single public endpoint topology:
+
+- Frontend is deployed on Vercel.
+- Backend stays local (`main.py --start-api`).
+- ngrok exposes local backend `:8080` to the public internet.
 
 ### 1) Start backend locally
+
+Windows:
+
+```powershell
+.\run_prod.bat
+```
+
+Linux/macOS:
+
 ```bash
 ./run_prod.sh
-# Windows:
-# run_prod.bat
 ```
 
-### 2) Expose backend with a tunnel
-Recommended: named Cloudflare Tunnel (persistent hostname):
+### 2) Start ngrok tunnel to backend port 8080
+
+One-time auth:
 
 ```bash
-cloudflared tunnel login
-cloudflared tunnel create aicam
-cloudflared tunnel route dns aicam api.your-domain.example.com
-cloudflared tunnel route dns aicam janus-api.your-domain.example.com
-# then copy cloudflared/config.yml.example -> cloudflared/config.yml
-# and run scripts/run-tunnel.sh (or scripts\run-tunnel.bat on Windows)
+ngrok config add-authtoken <YOUR_NGROK_TOKEN>
 ```
 
-Use `https://api.your-domain.example.com` as your backend base.
+Start tunnel (free random domain):
 
-### 3) Backend env vars (local machine)
-Set these before starting Python:
 ```bash
-API_KEY=your-shared-secret
-CORS_ORIGINS=https://your-app.vercel.app,http://localhost:5173,http://127.0.0.1:5173
-AICAM_JANUS_UPSTREAM=http://127.0.0.1:8088/janus
+ngrok http 8080
 ```
 
-Notes:
-- `CORS_ORIGINS` is read by `config.py` and passed to FastAPI CORS middleware.
-- Keep your Vercel origin in `CORS_ORIGINS`, and keep localhost origins if you still use local frontend dev.
+Or reserved domain:
 
-### 4) Vercel env vars (frontend project)
-Set in Vercel Project Settings -> Environment Variables:
 ```bash
-VITE_API_BASE=https://api.your-domain.example.com
-VITE_API_KEY=your-shared-secret
+ngrok http --domain=<your-name>.ngrok-free.app 8080
 ```
 
-Optional overrides:
-```bash
-VITE_WS_METADATA_URL=wss://api.your-domain.example.com/api/realtime/ws
-VITE_METADATA_LATEST_URL=https://api.your-domain.example.com/api/realtime/latest
-VITE_METADATA_POLL_MS=250
-VITE_WEBRTC_OFFER=https://api.your-domain.example.com/webrtc/offer
-VITE_JANUS_HTTP_URL=https://janus-api.your-domain.example.com/janus
-VITE_JANUS_MOUNTPOINT=1
-VITE_DISABLE_JANUS=false
-VITE_DIRECT_STREAM_URL=
-VITE_DIRECT_STREAM_KIND=auto
-VITE_DISABLE_BACKEND_VIDEO=true
+Use the resulting `https://...ngrok-free.app` as your public backend URL.
+
+### 3) Backend env (`.env.backend.local`)
+
+Use `.env.backend.local.example` and set:
+
+- `API_KEY=<shared-secret>`
+- `CORS_ORIGINS=https://<your-vercel-app>.vercel.app,http://localhost:5173,http://127.0.0.1:5173`
+- `AICAM_JANUS_UPSTREAM=http://127.0.0.1:8088/janus` (if you use Janus proxy path)
+
+### 4) Vercel frontend env vars
+
+In Vercel Project Settings -> Environment Variables (see `.env.vercel.example`):
+
+```env
+VITE_API_BASE=https://<your-ngrok-domain>.ngrok-free.app
+VITE_API_KEY=<same-shared-secret-as-API_KEY>
+VITE_JANUS_HTTP_URL=/janus
+VITE_DISABLE_JANUS=true
+VITE_DISABLE_BACKEND_VIDEO=false
 VITE_DISABLE_WEBRTC=false
 ```
 
-Notes for media routing:
-- Keep `VITE_DISABLE_BACKEND_VIDEO=true` when you want video to stay gateway/direct only.
-- If you provide `VITE_DIRECT_STREAM_URL`, frontend tries it first.
-- For RTSP cameras, use a gateway URL (Janus/HLS/WebRTC). Raw `rtsp://` is not browser-safe.
-- Cloudflare HTTP tunnel exposes Janus signaling only; remote WebRTC media still needs reachable ICE candidates (STUN/TURN + UDP).
+Notes:
 
-Single-domain ngrok mode (free plan):
-- Point `VITE_API_BASE` to your single `https://*.ngrok-free.dev` tunnel on backend `:8080`.
-- Keep `VITE_JANUS_HTTP_URL=/janus` so the frontend uses backend Janus proxy on the same domain.
-- Keep `AICAM_JANUS_UPSTREAM=http://127.0.0.1:8088/janus` on backend.
-- Recommended for stability: `VITE_DISABLE_BACKEND_VIDEO=true` (Janus-only media path).
+- Leave `VITE_WS_METADATA_URL` and `VITE_METADATA_LATEST_URL` empty to auto-derive from `VITE_API_BASE`.
+- `API_KEY` and `VITE_API_KEY` must match exactly.
+- After changing Vercel env vars, redeploy frontend.
 
-If `VITE_API_KEY` is set, the frontend will:
-- Send `x-api-key` on HTTP requests.
-- Append `api_key` to WS/media URLs where headers are unavailable in browser primitives.
+### 5) Validate end-to-end
 
-### 5) Deploy frontend to Vercel
-This repo includes `vercel.json` with SPA rewrite to `index.html`.
+Run preflight against ngrok URL:
 
-CLI flow:
 ```bash
-npm run build
-vercel
+VITE_API_BASE=https://<your-ngrok-domain>.ngrok-free.app VITE_API_KEY=<shared-secret> python tools/preflight_split_deploy.py
 ```
 
-Or connect the Git repository in Vercel and set the same environment variables there.
+Then open your Vercel URL and verify:
 
-## Janus live-view integration sample
-Use this pattern in `src/pages/LiveView.jsx` / `src/components/VideoCanvas.tsx`:
+- Metadata badge becomes `OPEN`.
+- Video badge shows `WEBRTC` or `MJPEG`.
+- Overlay boxes update on live view.
 
-```js
-const janusServer = "http://localhost:8088/janus";
-const mountpointId = 1;
+## Troubleshooting
 
-async function janusPost(path, body) {
-  const response = await fetch(`${janusServer}${path}`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ ...body, transaction: Math.random().toString(36).slice(2, 10) })
-  });
-  if (!response.ok) throw new Error(`Janus HTTP ${response.status}`);
-  return await response.json();
-}
+- No video in browser:
+  - Raw RTSP is not browser-safe; use Janus/gateway URL.
+  - Check Janus mountpoint and FFmpeg push.
+  - Inspect frontend badge for transport mode and error text.
 
-async function startJanus(videoEl) {
-  const create = await janusPost("", { janus: "create" });
-  const sessionId = create.data.id;
-  const attach = await janusPost(`/${sessionId}`, {
-    janus: "attach",
-    plugin: "janus.plugin.streaming"
-  });
-  const handleId = attach.data.id;
+- Metadata missing:
+  - Verify `/api/realtime/ws` and `/api/realtime/latest`.
+  - Confirm API key matches (`x-api-key` / `api_key`).
+  - Verify `VITE_API_BASE` points to the active ngrok URL (it changes when not reserved).
 
-  const pc = new RTCPeerConnection();
-  pc.ontrack = (ev) => {
-    videoEl.srcObject = ev.streams[0];
-    videoEl.play();
-  };
-  pc.onicecandidate = (ev) => {
-    janusPost(`/${sessionId}/${handleId}`, {
-      janus: "trickle",
-      candidate: ev.candidate ?? { completed: true }
-    }).catch(() => {});
-  };
+- High backend CPU:
+  - Prefer Janus/direct stream path for video.
+  - Keep `AICAM_CAPTURE_BUFFER=1`.
+  - Tune `detection_interval*` and `imgsz`.
 
-  await janusPost(`/${sessionId}/${handleId}`, {
-    janus: "message",
-    body: { request: "watch", id: mountpointId }
-  });
+- ngrok free plan + MJPEG issues:
+  - ngrok browser warning pages can break direct image stream usage.
+  - Prefer WebRTC path when possible.
 
-  // Poll Janus events, apply remote offer, create answer, then send "start".
-}
-```
+- Face detection unavailable warning:
+  - The app still runs, but recognition quality drops.
+  - Check `mediapipe` installation and backend logs.
 
-## API endpoints
-- `GET /api/health` / `GET /health` -> health + capabilities (`face_detector_available`, `processing_resolution`, etc.)
-- `GET /metrics` -> runtime counters/gauges (`face_attempts`, `face_detections`, `embedding_success`, `db_writes`, `active_tracks`, ...)
-- `GET /api/identities` -> identity list JSON
-- `GET /api/realtime/latest` -> latest metadata payload
-- `WS /api/realtime/ws` -> metadata stream
+## Useful Commands
 
-## Pipeline tuning keys (`config.yaml`)
-- `detection_interval` (default `1`)
-- `adaptive_detection_interval` (default `true`)
-- `detection_interval_max` (default `6`)
-- `target_fps` (default `30`)
-- `max_track_age_frames` (default `24`)
-- `face_interval_frames` (default `4`)
-- `face_top_ratio` (default `0.68`)
-- `face_min_pixels` (default `40`)
-- `body_fallback_enabled` (default `true`)
-- `body_fallback_after_face_failures` (default `3`)
-- `body_fallback_model_path` (default empty -> color-hist fallback)
-
-## Verification checklist
-- Janus container is healthy: `docker compose ps janus`
-- Janus player test works: open `janus/test-player.html` and see live video.
-- Frontend Live page shows `Video: JANUS`.
-- Boxes and IDs render in overlay from metadata WS.
-- `curl http://127.0.0.1:8080/api/health` returns status JSON.
-- `curl http://127.0.0.1:8080/api/identities` returns JSON list.
-- Stop Janus: frontend should automatically fall back to API WebRTC or MJPEG.
-
-## Debug checklist
-- No Janus video: verify `VITE_JANUS_HTTP_URL` and `VITE_JANUS_MOUNTPOINT`; UI should still fall back automatically.
-- No overlay: verify metadata WS at `/api/realtime/ws`.
-- High backend CPU: verify Janus is ingesting a direct H264 stream (`-c copy`) and avoid re-encode hops.
-- Janus mountpoint/auth issues: run `python tools/check_janus_mountpoint.py` and inspect `docker compose logs janus`.
-- Camera ingest issues: run `scripts/ffmpeg-push.sh` (or `scripts\ffmpeg-push.bat`) with `-c copy` to feed Janus RTP.
+- Frontend tests: `npm test`
+- Python tests: `pytest`
+- Verify API quickly: `python tools/verify_api.py`
+- Janus probe: `python tools/check_janus_mountpoint.py`
+- Split deploy preflight: `python tools/preflight_split_deploy.py`
