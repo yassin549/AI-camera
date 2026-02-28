@@ -28,7 +28,7 @@ interface VideoCanvasProps {
   onRosterChange?: (tracks: TrackPayload[]) => void;
 }
 
-type TransportMode = "connecting" | "direct" | "janus" | "webrtc" | "mjpeg" | "error";
+type TransportMode = "connecting" | "direct" | "janus" | "webrtc" | "wsjpeg" | "mjpeg" | "error";
 
 interface ProjectedTrack {
   track: TrackPayload;
@@ -113,6 +113,23 @@ function resolveApiUrl(pathOrUrl: string): string {
   const base = API.REST_BASE.replace(/\/+$/, "");
   const path = pathOrUrl.startsWith("/") ? pathOrUrl : `/${pathOrUrl}`;
   return `${base}${path}`;
+}
+
+function toWebSocketUrl(url: string): string {
+  if (!url) {
+    return url;
+  }
+  try {
+    const parsed = new URL(url, window.location.href);
+    if (parsed.protocol === "https:") {
+      parsed.protocol = "wss:";
+    } else if (parsed.protocol === "http:") {
+      parsed.protocol = "ws:";
+    }
+    return parsed.toString();
+  } catch {
+    return url;
+  }
 }
 
 function nextTx(): string {
@@ -201,6 +218,10 @@ export function VideoCanvas({
     [metadataLatestUrl]
   );
   const resolvedJanusHttpUrl = useMemo(() => resolveApiUrl(janusHttpUrl).replace(/\/+$/, ""), [janusHttpUrl]);
+  const resolvedWsJpegUrl = useMemo(
+    () => withApiKeyQuery(toWebSocketUrl(resolveApiUrl("/api/media/ws"))),
+    []
+  );
   const resolvedMjpegUrl = useMemo(() => withApiKeyQuery(resolveApiUrl("/api/media/mjpeg")), []);
   const resolvedDirectStreamUrl = useMemo(
     () => (directStreamUrl ? withApiKeyQuery(resolveApiUrl(directStreamUrl)) : ""),
@@ -232,6 +253,8 @@ export function VideoCanvas({
   const rafRef = useRef<number | null>(null);
   const janusPcRef = useRef<RTCPeerConnection | null>(null);
   const apiWebRtcPcRef = useRef<RTCPeerConnection | null>(null);
+  const wsJpegSocketRef = useRef<WebSocket | null>(null);
+  const wsJpegObjectUrlRef = useRef<string | null>(null);
   const janusAbortRef = useRef<AbortController | null>(null);
   const janusSessionRef = useRef<number | null>(null);
   const janusHandleRef = useRef<number | null>(null);
@@ -295,6 +318,24 @@ export function VideoCanvas({
       apiWebRtcPc.onicecandidate = null;
       apiWebRtcPc.close();
       apiWebRtcPcRef.current = null;
+    }
+    const wsJpegSocket = wsJpegSocketRef.current;
+    if (wsJpegSocket) {
+      try {
+        wsJpegSocket.onopen = null;
+        wsJpegSocket.onmessage = null;
+        wsJpegSocket.onerror = null;
+        wsJpegSocket.onclose = null;
+        wsJpegSocket.close();
+      } catch {
+        // Ignore websocket close errors during transport teardown.
+      }
+      wsJpegSocketRef.current = null;
+    }
+    const objectUrl = wsJpegObjectUrlRef.current;
+    if (objectUrl) {
+      URL.revokeObjectURL(objectUrl);
+      wsJpegObjectUrlRef.current = null;
     }
     const video = videoRef.current;
     if (video) {
@@ -732,6 +773,68 @@ export function VideoCanvas({
       return { ok: true, error: "" };
     };
 
+    const startWsJpegTransport = async (): Promise<{ ok: boolean; error: string }> => {
+      if (typeof WebSocket === "undefined" || !resolvedWsJpegUrl) {
+        return { ok: false, error: "Browser WebSocket unavailable" };
+      }
+      try {
+        const connected = await new Promise<boolean>((resolve) => {
+          const socket = new WebSocket(resolvedWsJpegUrl);
+          wsJpegSocketRef.current = socket;
+          socket.binaryType = "arraybuffer";
+          let receivedFrame = false;
+          const timeout = window.setTimeout(() => {
+            try {
+              socket.close();
+            } catch {
+              // Ignore close failures on timeout.
+            }
+            resolve(false);
+          }, 7000);
+
+          socket.onmessage = (event) => {
+            const blob = event.data instanceof Blob ? event.data : new Blob([event.data], { type: "image/jpeg" });
+            const nextUrl = URL.createObjectURL(blob);
+            const previousUrl = wsJpegObjectUrlRef.current;
+            wsJpegObjectUrlRef.current = nextUrl;
+            showMjpeg(nextUrl);
+            if (previousUrl) {
+              URL.revokeObjectURL(previousUrl);
+            }
+            if (!receivedFrame) {
+              receivedFrame = true;
+              window.clearTimeout(timeout);
+              transportModeRef.current = "wsjpeg";
+              setTransportMode("wsjpeg");
+              setTransportError(null);
+              resolve(true);
+            }
+          };
+          socket.onerror = () => {
+            if (!receivedFrame) {
+              window.clearTimeout(timeout);
+              resolve(false);
+            }
+          };
+          socket.onclose = () => {
+            if (!receivedFrame) {
+              window.clearTimeout(timeout);
+              resolve(false);
+            }
+          };
+        });
+        if (!connected) {
+          closeTransport();
+          return { ok: false, error: "WS-JPEG stream did not start" };
+        }
+        return { ok: true, error: "" };
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : "WS-JPEG negotiation failed";
+        closeTransport();
+        return { ok: false, error: message };
+      }
+    };
+
     const bootstrapVideo = async () => {
       setTransportError(null);
       transportModeRef.current = "connecting";
@@ -785,6 +888,14 @@ export function VideoCanvas({
         setTransportError(failures.join(" | "));
         return;
       }
+      const wsJpegReady = await startWsJpegTransport();
+      if (cancelled) {
+        return;
+      }
+      if (wsJpegReady.ok) {
+        return;
+      }
+      failures.push(`WS-JPEG: ${wsJpegReady.error}`);
       const mjpegReady = await startMjpegTransport();
       if (cancelled) {
         return;
@@ -813,6 +924,7 @@ export function VideoCanvas({
     resolvedDirectStreamUrl,
     resolvedJanusHttpUrl,
     resolvedJanusMountpoint,
+    resolvedWsJpegUrl,
     resolvedMjpegUrl
   ]);
 
