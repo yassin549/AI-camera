@@ -3,7 +3,7 @@
 AIcam is a local-first computer vision stack for live camera streams:
 
 - Python backend captures frames, detects/tracks people, and links tracks to identities.
-- FastAPI serves identities, realtime metadata, WebRTC/MJPEG fallbacks, and a Janus proxy.
+- FastAPI serves identities, realtime metadata, degraded JPEG fallback streaming, and a Janus proxy.
 - React frontend renders video and draws overlays client-side from metadata.
 
 The key design is to keep **video transport separate from CV metadata** for lower latency and lower CPU.
@@ -31,18 +31,16 @@ The key design is to keep **video transport separate from CV metadata** for lowe
 4. **API server thread** (`api_server.py` + `api/*`)
    - Publishes realtime metadata (`/api/realtime/ws`, `/api/realtime/latest`).
    - Serves identities (`/api/identities`) and media (`/media/*`).
-   - Offers backend WebRTC fallback (`/webrtc/offer`) and MJPEG (`/api/media/mjpeg`).
+   - Serves degraded JPEG fallback endpoints (`/api/media/ws`, `/api/media/mjpeg`).
    - Proxies Janus HTTP signaling (`/janus/*`) to upstream Janus.
 
 ### Frontend media + metadata model
 
 `src/components/VideoCanvas.tsx` uses independent channels:
 
-- **Video channel** (best-effort fallback order):
-  1. Direct stream URL (if configured)
-  2. Janus WebRTC
-  3. Backend WebRTC (`/webrtc/offer`)
-  4. Backend MJPEG (`/api/media/mjpeg`)
+- **Video channel** (deterministic startup plan):
+  1. Janus WebRTC (`VITE_VIDEO_PRIMARY_TRANSPORT=janus`)
+  2. One explicit degraded fallback (`VITE_VIDEO_FALLBACK_TRANSPORT`, default `wsjpeg`)
 
 - **Metadata channel**:
   - Primary: WebSocket `/api/realtime/ws`
@@ -57,7 +55,7 @@ Core files you will likely touch first:
 - `main.py`: backend orchestrator and CLI entrypoint.
 - `config.yaml`: runtime pipeline config (camera URL, thresholds, FPS, API host/port).
 - `api_server.py`: FastAPI app wiring and shared runtime state.
-- `api/realtime.py`: metadata WS + backend WebRTC offer route.
+- `api/realtime.py`: metadata WS route.
 - `api/media.py`: MJPEG stream + static media mount.
 - `api/identities.py`: identity CRUD + reindexing.
 - `src/pages/LiveView.tsx`: live UI.
@@ -205,21 +203,37 @@ python tools/check_janus_mountpoint.py
 - `imgsz`: processing resolution used by capture + detector pipeline.
 - `target_fps`: used for adaptive scheduling.
 - `detection_interval`, `detection_interval_max`, `adaptive_detection_interval`.
+- `detection_duty_cycle_target`, `detection_duty_cycle_hysteresis`, `detection_interval_cooldown_frames`.
+- `detection_duty_cycle_ema_alpha`: smoothing for duty-cycle control.
+- `detection_min_gap_scale`: minimum detector cooldown relative to measured detector time.
+- `adaptive_detection_resolution`, `detection_resolution_profiles`.
+- `detection_resolution_cooldown_detections`, `detection_resolution_warmup_runs`.
 - `face_interval_frames`, `body_interval_frames`.
 - `face_threshold`, `body_threshold`.
+- `recognition_persist_queue_size`, `recognition_persist_batch_size`.
+- `recognition_media_queue_size`, `recognition_media_batch_size`.
 - `max_tracks`, `max_track_age_frames`.
 - `http_host`, `http_port`.
+- `detector_backend`, `detector_model_path`: select detector backend (`yolo_onnx` or `rtdetr_onnx`) and model.
+- `detector_output_format`, `detector_person_class_id`, `detector_max_detections`: RT-DETR output parsing controls.
 - `yolo_onnx_path`: person detector ONNX path.
+- `yolo_onnx_fast_path`, `prefer_fast_person_model`: auto-select optimized INT8 model when available.
+- `rtdetr_onnx_path`: RT-DETR ONNX path used when backend is `rtdetr_onnx`.
+- `body_fallback_model_path`, `body_fallback_input_size`, `body_fallback_target_dim`: body re-ID fallback model settings.
+- `face_embedder_backend`, `face_onnx_model_path`, `face_onnx_input_size`: face embedding backend/model settings.
+- `onnx_intra_threads`, `onnx_inter_threads`, `detector_warmup_runs`.
 
 ### Backend env vars
 
 - `API_KEY`: enables auth on identities/realtime/media/janus routes.
 - `CORS_ORIGINS`, `CORS_ORIGIN_REGEX`: browser access control.
 - `AICAM_ENABLE_FRAME_STREAMING`: enables backend WebRTC/MJPEG frame streaming.
-- `AICAM_MJPEG_FPS`, `AICAM_MJPEG_QUALITY`, `AICAM_MJPEG_MAX_CLIENTS`.
+- `AICAM_MJPEG_FPS`, `AICAM_MJPEG_QUALITY`, `AICAM_MJPEG_QUALITY_MIN`, `AICAM_MJPEG_MAX_CLIENTS`.
+- `AICAM_WSJPEG_ADAPTIVE`, `AICAM_WSJPEG_MIN_FPS`, `AICAM_WSJPEG_QUALITY_STEP`, `AICAM_WSJPEG_SLOW_SEND_MS`, `AICAM_WSJPEG_FAST_SEND_MS`.
 - `AICAM_CAPTURE_BUFFER`: capture queue size (low value reduces latency).
 - `AICAM_WS_HEARTBEAT_SEC`, `AICAM_WS_MAX_CLIENTS`.
 - `AICAM_JANUS_UPSTREAM`: upstream Janus URL for `/janus` proxy.
+- `AICAM_ORT_*`: ONNXRuntime detector tuning (`INTRA_THREADS`, `INTER_THREADS`, execution mode, graph opt, memory/spin flags).
 - `AICAM_STATIC_PATH`: media root for `/media`.
 - `AICAM_DELETE_SAMPLE_FILES`: delete files on identity delete.
 
@@ -232,8 +246,8 @@ python tools/check_janus_mountpoint.py
 - `VITE_METADATA_POLL_MS`
 - `VITE_JANUS_HTTP_URL`
 - `VITE_JANUS_MOUNTPOINT`
-- `VITE_DIRECT_STREAM_URL`
-- `VITE_DIRECT_STREAM_KIND` (`auto|video|image`)
+- `VITE_VIDEO_PRIMARY_TRANSPORT` (`janus`)
+- `VITE_VIDEO_FALLBACK_TRANSPORT` (`wsjpeg|none`)
 - `VITE_DISABLE_JANUS`
 - `VITE_DISABLE_BACKEND_VIDEO`
 - `VITE_DISABLE_WEBRTC`
@@ -249,17 +263,18 @@ python tools/check_janus_mountpoint.py
 - `POST /api/identities/reindex`
 - `GET /api/realtime/latest`
 - `WS /api/realtime/ws`
-- `POST /webrtc/offer`
+- `WS /api/media/ws`
 - `GET /api/media/mjpeg`
 - `GET|POST /janus/*` (reverse proxy)
 
-## Vercel Frontend + ngrok Backend (Required Deployment Mode)
+## Vercel Frontend + Local Backend/Janus (Split Deployment)
 
-This project supports a single public endpoint topology:
+This project targets a split public topology:
 
-- Frontend is deployed on Vercel.
-- Backend stays local (`main.py --start-api`).
-- ngrok exposes local backend `:8080` to the public internet.
+- Frontend is deployed on Vercel (static UI only).
+- Backend stays local (`main.py --start-api`) for CV + metadata APIs.
+- Janus stays local for camera media and is exposed via its own public endpoint.
+- Browser connects directly to backend metadata endpoints and Janus signaling/media.
 
 ### 1) Start backend locally
 
@@ -275,7 +290,7 @@ Linux/macOS:
 ./run_prod.sh
 ```
 
-### 2) Start ngrok tunnel to backend port 8080
+### 2) Expose backend and Janus endpoints
 
 One-time auth:
 
@@ -295,7 +310,7 @@ Or reserved domain:
 ngrok http --domain=<your-name>.ngrok-free.app 8080
 ```
 
-Use the resulting `https://...ngrok-free.app` as your public backend URL.
+Use the resulting public URL as `VITE_API_BASE` and expose Janus HTTP signaling separately for `VITE_JANUS_HTTP_URL`.
 
 ### 3) Backend env (`.env.backend.local`)
 
@@ -310,12 +325,14 @@ Use `.env.backend.local.example` and set:
 In Vercel Project Settings -> Environment Variables (see `.env.vercel.example`):
 
 ```env
-VITE_API_BASE=https://<your-ngrok-domain>.ngrok-free.app
+VITE_API_BASE=https://<your-backend-domain>
 VITE_API_KEY=<same-shared-secret-as-API_KEY>
-VITE_JANUS_HTTP_URL=/janus
-VITE_DISABLE_JANUS=true
+VITE_JANUS_HTTP_URL=https://<your-janus-domain>/janus
+VITE_DISABLE_JANUS=false
 VITE_DISABLE_BACKEND_VIDEO=false
 VITE_DISABLE_WEBRTC=false
+VITE_VIDEO_PRIMARY_TRANSPORT=janus
+VITE_VIDEO_FALLBACK_TRANSPORT=wsjpeg
 ```
 
 Notes:
@@ -326,16 +343,16 @@ Notes:
 
 ### 5) Validate end-to-end
 
-Run preflight against ngrok URL:
+Run preflight against your public backend URL:
 
 ```bash
-VITE_API_BASE=https://<your-ngrok-domain>.ngrok-free.app VITE_API_KEY=<shared-secret> python tools/preflight_split_deploy.py
+VITE_API_BASE=https://<your-backend-domain> VITE_API_KEY=<shared-secret> python tools/preflight_split_deploy.py
 ```
 
 Then open your Vercel URL and verify:
 
 - Metadata badge becomes `OPEN`.
-- Video badge shows `WEBRTC` or `MJPEG`.
+- Video badge shows `JANUS` in healthy mode (`WSJPEG` only under fallback).
 - Overlay boxes update on live view.
 
 ## Troubleshooting
@@ -351,7 +368,7 @@ Then open your Vercel URL and verify:
   - Verify `VITE_API_BASE` points to the active ngrok URL (it changes when not reserved).
 
 - High backend CPU:
-  - Prefer Janus/direct stream path for video.
+  - Prefer Janus primary path for video.
   - Keep `AICAM_CAPTURE_BUFFER=1`.
   - Tune `detection_interval*` and `imgsz`.
 
@@ -370,3 +387,4 @@ Then open your Vercel URL and verify:
 - Verify API quickly: `python tools/verify_api.py`
 - Janus probe: `python tools/check_janus_mountpoint.py`
 - Split deploy preflight: `python tools/preflight_split_deploy.py`
+- Phase6 perf gate: `python scripts/perf/run_phase6_gate.py --config config.yaml --seconds 60 --output-dir artifacts/perf`

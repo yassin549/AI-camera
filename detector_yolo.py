@@ -12,7 +12,6 @@ import numpy as np
 import onnxruntime as ort
 
 from embedder_body import MobileNetBodyFallback, body_descriptor_from_backbone
-from utils import iou
 
 LOGGER = logging.getLogger(__name__)
 
@@ -37,17 +36,57 @@ class YOLOv8ONNXDetector:
         feature_output_name: Optional[str] = None,
         disable_body_embedding: bool = True,
         body_fallback_model_path: Optional[str] = None,
+        body_fallback_input_size: Tuple[int, int] = (128, 256),
+        body_fallback_target_dim: int = 256,
+        body_fallback_mean: float = 0.5,
+        body_fallback_std: float = 0.5,
+        body_fallback_output_name: Optional[str] = None,
+        body_fallback_output_index: int = 0,
+        onnx_intra_threads: Optional[int] = None,
+        onnx_inter_threads: Optional[int] = None,
     ) -> None:
         self.model_path = str(model_path)
         self.capture_size = (int(imgsz[0]), int(imgsz[1]))
         self.conf_threshold = float(conf_threshold)
         self.iou_threshold = float(iou_threshold)
         self.disable_body_embedding = bool(disable_body_embedding)
+        self.body_feature_dim = max(16, int(body_fallback_target_dim))
+
+        intra_threads = self._resolve_thread_count(
+            explicit=onnx_intra_threads,
+            env_var="AICAM_ORT_INTRA_THREADS",
+            fallback=max(1, min(6, (os.cpu_count() or 2) // 2)),
+        )
+        inter_threads = self._resolve_thread_count(
+            explicit=onnx_inter_threads,
+            env_var="AICAM_ORT_INTER_THREADS",
+            fallback=1,
+        )
+        execution_mode_label, execution_mode = self._resolve_execution_mode(
+            str(os.getenv("AICAM_ORT_EXECUTION_MODE", "sequential"))
+        )
+        graph_opt_label, graph_opt_level = self._resolve_graph_opt_level(
+            str(os.getenv("AICAM_ORT_GRAPH_OPT_LEVEL", "all"))
+        )
+        enable_mem_pattern = self._resolve_bool_env("AICAM_ORT_ENABLE_MEM_PATTERN", True)
+        enable_cpu_mem_arena = self._resolve_bool_env("AICAM_ORT_ENABLE_CPU_MEM_ARENA", True)
+        intra_spin = self._resolve_bool_env("AICAM_ORT_INTRA_SPIN", True)
+        inter_spin = self._resolve_bool_env("AICAM_ORT_INTER_SPIN", True)
 
         so = ort.SessionOptions()
-        so.intra_op_num_threads = max(1, min(4, (os.cpu_count() or 2) // 2))
-        so.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
-        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        if intra_threads > 0:
+            so.intra_op_num_threads = intra_threads
+        if inter_threads > 0:
+            so.inter_op_num_threads = inter_threads
+        so.execution_mode = execution_mode
+        so.graph_optimization_level = graph_opt_level
+        so.enable_mem_pattern = bool(enable_mem_pattern)
+        so.enable_cpu_mem_arena = bool(enable_cpu_mem_arena)
+        try:
+            so.add_session_config_entry("session.intra_op.allow_spinning", "1" if intra_spin else "0")
+            so.add_session_config_entry("session.inter_op.allow_spinning", "1" if inter_spin else "0")
+        except Exception:
+            LOGGER.debug("Could not apply ORT spinning config entries", exc_info=True)
 
         self.session = ort.InferenceSession(
             self.model_path,
@@ -74,7 +113,15 @@ class YOLOv8ONNXDetector:
                         self.feature_output_name = out.name
                         break
             if self.feature_output_name is None:
-                self.body_fallback = MobileNetBodyFallback(model_path=body_fallback_model_path)
+                self.body_fallback = MobileNetBodyFallback(
+                    model_path=body_fallback_model_path,
+                    input_size=body_fallback_input_size,
+                    target_dim=self.body_feature_dim,
+                    mean=float(body_fallback_mean),
+                    std=float(body_fallback_std),
+                    output_name=body_fallback_output_name,
+                    output_index=int(body_fallback_output_index),
+                )
 
         LOGGER.info(
             "Detector input canvas: %sx%s | capture frame: %sx%s",
@@ -84,9 +131,67 @@ class YOLOv8ONNXDetector:
             self.capture_size[1],
         )
         LOGGER.info(
+            "ONNXRuntime threads: intra=%s inter=%s",
+            intra_threads if intra_threads > 0 else "default",
+            inter_threads if inter_threads > 0 else "default",
+        )
+        LOGGER.info(
+            "ONNXRuntime tuning: mode=%s graph_opt=%s mem_pattern=%s cpu_mem_arena=%s intra_spin=%s inter_spin=%s",
+            execution_mode_label,
+            graph_opt_label,
+            str(enable_mem_pattern).lower(),
+            str(enable_cpu_mem_arena).lower(),
+            str(intra_spin).lower(),
+            str(inter_spin).lower(),
+        )
+        LOGGER.info(
             "Body embedding mode: %s",
             "yolo_backbone" if self.feature_output_name else ("crop_fallback" if self.body_fallback else "disabled"),
         )
+
+    @staticmethod
+    def _resolve_thread_count(explicit: Optional[int], env_var: str, fallback: int) -> int:
+        if explicit is not None:
+            try:
+                return max(0, int(explicit))
+            except Exception:
+                return max(0, int(fallback))
+        raw = str(os.getenv(env_var, "")).strip()
+        if not raw:
+            return max(0, int(fallback))
+        try:
+            return max(0, int(raw))
+        except Exception:
+            return max(0, int(fallback))
+
+    @staticmethod
+    def _resolve_bool_env(env_var: str, fallback: bool) -> bool:
+        raw = str(os.getenv(env_var, "")).strip().lower()
+        if not raw:
+            return bool(fallback)
+        if raw in {"1", "true", "yes", "on"}:
+            return True
+        if raw in {"0", "false", "no", "off"}:
+            return False
+        return bool(fallback)
+
+    @staticmethod
+    def _resolve_execution_mode(raw: str) -> Tuple[str, ort.ExecutionMode]:
+        normalized = str(raw).strip().lower()
+        if normalized in {"parallel", "ort_parallel"}:
+            return "parallel", ort.ExecutionMode.ORT_PARALLEL
+        return "sequential", ort.ExecutionMode.ORT_SEQUENTIAL
+
+    @staticmethod
+    def _resolve_graph_opt_level(raw: str) -> Tuple[str, ort.GraphOptimizationLevel]:
+        normalized = str(raw).strip().lower()
+        if normalized in {"disable", "disabled", "0", "off"}:
+            return "disable", ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+        if normalized in {"basic", "1"}:
+            return "basic", ort.GraphOptimizationLevel.ORT_ENABLE_BASIC
+        if normalized in {"extended", "2"}:
+            return "extended", ort.GraphOptimizationLevel.ORT_ENABLE_EXTENDED
+        return "all", ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
     @staticmethod
     def _resolve_model_input_size(
@@ -105,8 +210,11 @@ class YOLOv8ONNXDetector:
             return []
 
         tensor, map_info = self._to_model_tensor(frame_bgr)
-        outputs = self.session.run(self.output_names, {self.input_name: tensor})
-        out_by_name: Dict[str, np.ndarray] = {k: v for k, v in zip(self.output_names, outputs)}
+        output_names = [self.det_output_name]
+        if self.feature_output_name:
+            output_names.append(self.feature_output_name)
+        outputs = self.session.run(output_names, {self.input_name: tensor})
+        out_by_name: Dict[str, np.ndarray] = {k: v for k, v in zip(output_names, outputs)}
 
         raw_det = out_by_name[self.det_output_name]
         backbone = out_by_name.get(self.feature_output_name) if self.feature_output_name else None
@@ -119,7 +227,7 @@ class YOLOv8ONNXDetector:
                     backbone_feature=backbone,
                     det_bbox_input_xyxy=self._map_frame_box_to_model(det.bbox, map_info),
                     model_input_size=self.model_input_size,
-                    target_dim=256,
+                    target_dim=self.body_feature_dim,
                 )
         elif not self.disable_body_embedding and self.body_fallback is not None:
             for det in detections:
@@ -128,6 +236,37 @@ class YOLOv8ONNXDetector:
                 det.feature = self.body_fallback.embed(crop)
 
         return detections
+
+    def set_capture_size(self, imgsz: Tuple[int, int]) -> None:
+        self.capture_size = (max(1, int(imgsz[0])), max(1, int(imgsz[1])))
+
+    def warmup(self, runs: int = 2, capture_sizes: Optional[Sequence[Tuple[int, int]]] = None) -> None:
+        run_count = max(0, int(runs))
+        if run_count <= 0:
+            return
+        warmup_sizes: List[Tuple[int, int]] = []
+        if capture_sizes:
+            for size in capture_sizes:
+                if not isinstance(size, (tuple, list)) or len(size) < 2:
+                    continue
+                w = max(1, int(size[0]))
+                h = max(1, int(size[1]))
+                warmup_sizes.append((w, h))
+        if not warmup_sizes:
+            warmup_sizes = [self.capture_size]
+
+        seen: set[Tuple[int, int]] = set()
+        deduped: List[Tuple[int, int]] = []
+        for size in warmup_sizes:
+            if size in seen:
+                continue
+            seen.add(size)
+            deduped.append(size)
+
+        for width, height in deduped:
+            dummy = np.zeros((height, width, 3), dtype=np.uint8)
+            for _ in range(run_count):
+                self.detect(dummy)
 
     def _to_model_tensor(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, Dict[str, float]]:
         """
@@ -175,53 +314,71 @@ class YOLOv8ONNXDetector:
             return []
 
         # Exported YOLOv8 ONNX typically [84,8400] -> transpose to [8400,84]
-        if pred.shape[0] <= 96 and pred.shape[1] > pred.shape[0]:
+        if pred.shape[0] <= 96 and pred.shape[1] >= 256 and pred.shape[1] > pred.shape[0]:
             pred = pred.T
 
-        boxes_model: List[Tuple[int, int, int, int]] = []
-        scores: List[float] = []
+        boxes_model = np.zeros((0, 4), dtype=np.int32)
+        scores = np.zeros((0,), dtype=np.float32)
 
         cols = pred.shape[1]
         if cols >= 84:
             # [cx,cy,w,h, class0, class1, ...]
-            xywh = pred[:, :4]
-            cls_person = pred[:, 4]  # class 0: person
+            xywh = pred[:, :4].astype(np.float32, copy=False)
+            cls_person = pred[:, 4].astype(np.float32, copy=False)  # class 0: person
             keep = cls_person >= self.conf_threshold
-            xywh = xywh[keep]
-            cls_person = cls_person[keep]
-            tw, th = self.model_input_size
-
-            for row, score in zip(xywh, cls_person):
-                cx, cy, bw, bh = [float(v) for v in row]
-                x1 = int(max(0.0, cx - bw / 2.0))
-                y1 = int(max(0.0, cy - bh / 2.0))
-                x2 = int(min(float(tw), cx + bw / 2.0))
-                y2 = int(min(float(th), cy + bh / 2.0))
-                if x2 > x1 and y2 > y1:
-                    boxes_model.append((x1, y1, x2, y2))
-                    scores.append(float(score))
+            if np.any(keep):
+                xywh = xywh[keep]
+                scores = cls_person[keep]
+                tw, th = self.model_input_size
+                cx = xywh[:, 0]
+                cy = xywh[:, 1]
+                bw = xywh[:, 2]
+                bh = xywh[:, 3]
+                x1 = np.clip(cx - bw * 0.5, 0.0, float(max(0, tw - 1)))
+                y1 = np.clip(cy - bh * 0.5, 0.0, float(max(0, th - 1)))
+                x2 = np.clip(cx + bw * 0.5, 1.0, float(max(1, tw)))
+                y2 = np.clip(cy + bh * 0.5, 1.0, float(max(1, th)))
+                valid = (x2 > x1) & (y2 > y1)
+                if np.any(valid):
+                    boxes_model = np.stack([x1[valid], y1[valid], x2[valid], y2[valid]], axis=1).astype(np.int32)
+                    scores = scores[valid]
+                else:
+                    scores = np.zeros((0,), dtype=np.float32)
         elif cols >= 6:
             # Decoded format [x1,y1,x2,y2,score,cls]
-            for row in pred:
-                cls = int(row[5])
-                if cls != 0:
-                    continue
-                score = float(row[4])
-                if score < self.conf_threshold:
-                    continue
-                x1, y1, x2, y2 = [int(v) for v in row[:4]]
-                if x2 > x1 and y2 > y1:
-                    boxes_model.append((x1, y1, x2, y2))
-                    scores.append(score)
+            decoded = pred[:, :6].astype(np.float32, copy=False)
+            keep = (decoded[:, 5].astype(np.int32) == 0) & (decoded[:, 4] >= self.conf_threshold)
+            if np.any(keep):
+                selected = decoded[keep]
+                tw, th = self.model_input_size
+                x1 = np.clip(selected[:, 0], 0.0, float(max(0, tw - 1)))
+                y1 = np.clip(selected[:, 1], 0.0, float(max(0, th - 1)))
+                x2 = np.clip(selected[:, 2], 1.0, float(max(1, tw)))
+                y2 = np.clip(selected[:, 3], 1.0, float(max(1, th)))
+                valid = (x2 > x1) & (y2 > y1)
+                if np.any(valid):
+                    boxes_model = np.stack([x1[valid], y1[valid], x2[valid], y2[valid]], axis=1).astype(np.int32)
+                    scores = selected[:, 4][valid].astype(np.float32)
+                else:
+                    scores = np.zeros((0,), dtype=np.float32)
+
+        if boxes_model.shape[0] == 0:
+            return []
 
         keep_idx = self._nms(boxes_model, scores, self.iou_threshold)
 
         out: List[Detection] = []
         for i in keep_idx:
-            x1, y1, x2, y2 = self._map_model_box_to_frame(boxes_model[i], map_info, frame_w, frame_h)
+            box = boxes_model[int(i)]
+            x1, y1, x2, y2 = self._map_model_box_to_frame(
+                (int(box[0]), int(box[1]), int(box[2]), int(box[3])),
+                map_info,
+                frame_w,
+                frame_h,
+            )
             if x2 <= x1 or y2 <= y1:
                 continue
-            out.append(Detection(bbox=(x1, y1, x2, y2), score=float(scores[i]), class_id=0, feature=None))
+            out.append(Detection(bbox=(x1, y1, x2, y2), score=float(scores[int(i)]), class_id=0, feature=None))
         return out
 
     def _map_model_box_to_frame(
@@ -277,9 +434,16 @@ class YOLOv8ONNXDetector:
         scores: Sequence[float],
         iou_thr: float,
     ) -> List[int]:
-        if not boxes:
+        boxes_arr = np.asarray(boxes, dtype=np.float32)
+        scores_arr = np.asarray(scores, dtype=np.float32).reshape(-1)
+        if boxes_arr.size == 0 or scores_arr.size == 0:
             return []
-        order = np.argsort(np.asarray(scores, dtype=np.float32))[::-1]
+        x1 = boxes_arr[:, 0]
+        y1 = boxes_arr[:, 1]
+        x2 = boxes_arr[:, 2]
+        y2 = boxes_arr[:, 3]
+        areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+        order = np.argsort(scores_arr)[::-1]
         keep: List[int] = []
         while order.size > 0:
             i = int(order[0])
@@ -287,9 +451,14 @@ class YOLOv8ONNXDetector:
             if order.size == 1:
                 break
             rest = order[1:]
-            survivors = []
-            for j in rest:
-                if iou(boxes[i], boxes[int(j)]) < iou_thr:
-                    survivors.append(int(j))
-            order = np.asarray(survivors, dtype=np.int32)
+            xx1 = np.maximum(x1[i], x1[rest])
+            yy1 = np.maximum(y1[i], y1[rest])
+            xx2 = np.minimum(x2[i], x2[rest])
+            yy2 = np.minimum(y2[i], y2[rest])
+            inter_w = np.maximum(0.0, xx2 - xx1)
+            inter_h = np.maximum(0.0, yy2 - yy1)
+            inter = inter_w * inter_h
+            union = areas[i] + areas[rest] - inter + 1e-10
+            overlap = inter / union
+            order = rest[np.where(overlap < float(iou_thr))[0]]
         return keep

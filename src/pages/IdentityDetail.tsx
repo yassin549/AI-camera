@@ -89,13 +89,15 @@ export function IdentityDetail(): JSX.Element {
     if (!detail) {
       return;
     }
-    const nextName = window.prompt("Rename identity to:", detail.id);
-    if (!nextName || nextName === detail.id) {
+    const currentName = detail.display_name ?? detail.id;
+    const nextName = window.prompt("Rename identity to:", currentName);
+    if (!nextName || nextName === currentName) {
       return;
     }
     try {
       setStatus("Renaming...");
       await renameIdentity(detail.id, nextName);
+      setDetail((prev) => (prev ? { ...prev, display_name: nextName } : prev));
       setStatus("Rename complete");
     } catch (err) {
       setStatus(err instanceof Error ? err.message : "Rename failed");
@@ -162,7 +164,9 @@ export function IdentityDetail(): JSX.Element {
         ) : (
           <>
             <div className="mt-5 flex flex-wrap items-center justify-between gap-3">
-              <h1 className="text-2xl font-semibold text-slate-100">Identity {detail?.id}</h1>
+              <h1 className="text-2xl font-semibold text-slate-100">
+                {detail?.display_name?.trim() || `Identity ${detail?.id}`}
+              </h1>
               <div className="flex flex-wrap gap-2">
                 <button
                   type="button"
@@ -193,6 +197,7 @@ export function IdentityDetail(): JSX.Element {
                 <div className="text-xs uppercase tracking-[0.14em] text-slate-400">Summary</div>
                 <div className="mt-3 text-sm text-slate-200">First seen: {formatDate(detail?.first_seen ?? "")}</div>
                 <div className="mt-2 text-sm text-slate-200">Last seen: {formatDate(detail?.last_seen ?? "")}</div>
+                <div className="mt-2 text-sm text-slate-200">Muted: {detail?.is_muted ? "Yes" : "No"}</div>
                 <div className="mt-2 text-sm text-slate-200">
                   Frequency: {detail?.stats?.frequency ?? detail?.stats?.sightings ?? 0}
                 </div>

@@ -1,0 +1,79 @@
+{
+  "phase": "phase1",
+  "version": "2026-02-28",
+  "description": "Initial hard performance targets for the AIcam runtime.",
+  "targets": [
+    {
+      "name": "detector_fps_min",
+      "source": "metrics",
+      "metric": "fps_detector",
+      "op": ">=",
+      "value": 8.0,
+      "unit": "fps"
+    },
+    {
+      "name": "tracker_fps_min",
+      "source": "metrics",
+      "metric": "fps_tracker",
+      "op": ">=",
+      "value": 25.0,
+      "unit": "fps"
+    },
+    {
+      "name": "detection_p95_ms_max",
+      "source": "metrics",
+      "metric": "ms_p95_detection",
+      "op": "<=",
+      "value": 180.0,
+      "unit": "ms"
+    },
+    {
+      "name": "tracking_p95_ms_max",
+      "source": "metrics",
+      "metric": "ms_p95_tracking",
+      "op": "<=",
+      "value": 30.0,
+      "unit": "ms"
+    },
+    {
+      "name": "recognition_p95_ms_max",
+      "source": "metrics",
+      "metric": "ms_p95_recognition",
+      "op": "<=",
+      "value": 25.0,
+      "unit": "ms"
+    },
+    {
+      "name": "local_video_latency_ms_max",
+      "source": "manual",
+      "metric": "local_video_latency_ms",
+      "op": "<=",
+      "value": 250.0,
+      "unit": "ms"
+    },
+    {
+      "name": "remote_video_latency_ms_max",
+      "source": "manual",
+      "metric": "remote_video_latency_ms",
+      "op": "<=",
+      "value": 800.0,
+      "unit": "ms"
+    },
+    {
+      "name": "metadata_freshness_ms_max",
+      "source": "manual",
+      "metric": "metadata_freshness_ms",
+      "op": "<=",
+      "value": 250.0,
+      "unit": "ms"
+    },
+    {
+      "name": "identity_thumbnail_load_ms_max",
+      "source": "manual",
+      "metric": "identity_thumbnail_load_ms",
+      "op": "<=",
+      "value": 500.0,
+      "unit": "ms"
+    }
+  ]
+}

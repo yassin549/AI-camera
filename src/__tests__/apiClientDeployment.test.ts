@@ -63,7 +63,11 @@ describe("api client split deployment behavior", () => {
     expect(headers.get("x-api-key")).toBe("topsecret");
 
     expect(identities[0].id).toBe("7");
-    expect(identities[0].face_samples).toEqual(["https://api.example.com/media/faces/7_1.jpg"]);
-    expect(identities[0].body_samples).toEqual(["https://api.example.com/media/body/7_1.jpg"]);
+    expect(identities[0].face_samples).toEqual([
+      "https://api.example.com/media/faces/7_1.jpg?api_key=topsecret"
+    ]);
+    expect(identities[0].body_samples).toEqual([
+      "https://api.example.com/media/body/7_1.jpg?api_key=topsecret"
+    ]);
   });
 });

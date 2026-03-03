@@ -138,20 +138,21 @@ VITE_METADATA_LATEST_URL=https://api.your-domain.example.com/api/realtime/latest
 VITE_METADATA_POLL_MS=250
 VITE_JANUS_HTTP_URL=https://janus-api.your-domain.example.com/janus
 VITE_JANUS_MOUNTPOINT=1
-VITE_DISABLE_BACKEND_VIDEO=true
+VITE_DISABLE_JANUS=false
+VITE_DISABLE_BACKEND_VIDEO=false
 VITE_DISABLE_WEBRTC=false
+VITE_VIDEO_PRIMARY_TRANSPORT=janus
+VITE_VIDEO_FALLBACK_TRANSPORT=wsjpeg
 ```
 
 Optional:
 
 ```env
-VITE_DIRECT_STREAM_URL=
-VITE_DIRECT_STREAM_KIND=auto
 VITE_DISABLE_WEBRTC=false
 ```
 
 Notes:
-- Keep `VITE_DISABLE_BACKEND_VIDEO=true` to force video away from backend relay.
+- Keep `VITE_VIDEO_PRIMARY_TRANSPORT=janus` with one explicit fallback (`wsjpeg`) for deterministic startup.
 - `VITE_API_KEY` must match backend `API_KEY`.
 - Raw `rtsp://` cannot be played by browsers; use Janus/HLS/MJPEG gateway URLs.
 - Cloudflare HTTP tunnel covers Janus signaling only; remote WebRTC media still requires STUN/TURN + UDP reachability.
@@ -193,7 +194,7 @@ Expected output:
 ## 10) Final validation in the app
 Open your Vercel app URL and verify:
 - Bottom badge shows:
-  - `Video: DIRECT` or `Video: JANUS`
+  - `Video: JANUS` (or `Video: WSJPEG` only during degraded fallback)
   - `Metadata: OPEN`
 - Overlay boxes appear and update smoothly.
 - Library page loads identities.

@@ -14,8 +14,14 @@ STATIC_PATH = Path(os.getenv("AICAM_STATIC_PATH", str(PROJECT_ROOT))).resolve()
 
 # Match camera FPS for smooth streaming; override with AICAM_MJPEG_FPS env var.
 MJPEG_FPS = max(1.0, float(os.getenv("AICAM_MJPEG_FPS", "30")))
-MJPEG_JPEG_QUALITY = int(os.getenv("AICAM_MJPEG_QUALITY", "80"))
+MJPEG_JPEG_QUALITY = max(1, min(100, int(os.getenv("AICAM_MJPEG_QUALITY", "80"))))
+MJPEG_JPEG_QUALITY_MIN = max(1, min(MJPEG_JPEG_QUALITY, int(os.getenv("AICAM_MJPEG_QUALITY_MIN", "35"))))
 MJPEG_MAX_CLIENTS = max(1, int(os.getenv("AICAM_MJPEG_MAX_CLIENTS", "8")))
+WSJPEG_ADAPTIVE = os.getenv("AICAM_WSJPEG_ADAPTIVE", "1").strip().lower() in {"1", "true", "yes"}
+WSJPEG_MIN_FPS = max(1.0, float(os.getenv("AICAM_WSJPEG_MIN_FPS", "6")))
+WSJPEG_QUALITY_STEP = max(1, int(os.getenv("AICAM_WSJPEG_QUALITY_STEP", "5")))
+WSJPEG_SLOW_SEND_MS = max(5.0, float(os.getenv("AICAM_WSJPEG_SLOW_SEND_MS", "90")))
+WSJPEG_FAST_SEND_MS = max(1.0, float(os.getenv("AICAM_WSJPEG_FAST_SEND_MS", "25")))
 ENABLE_FRAME_STREAMING = os.getenv("AICAM_ENABLE_FRAME_STREAMING", "1").strip().lower() in {
     "1",
     "true",

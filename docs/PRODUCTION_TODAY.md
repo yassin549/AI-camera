@@ -88,15 +88,11 @@ VITE_METADATA_LATEST_URL=https://api.your-domain.example.com/api/realtime/latest
 VITE_METADATA_POLL_MS=250
 VITE_JANUS_HTTP_URL=https://janus-api.your-domain.example.com/janus
 VITE_JANUS_MOUNTPOINT=1
-VITE_DISABLE_BACKEND_VIDEO=true
+VITE_DISABLE_JANUS=false
+VITE_DISABLE_BACKEND_VIDEO=false
 VITE_DISABLE_WEBRTC=false
-```
-
-Optional direct stream URL (non-backend):
-
-```bash
-VITE_DIRECT_STREAM_URL=
-VITE_DIRECT_STREAM_KIND=auto
+VITE_VIDEO_PRIMARY_TRANSPORT=janus
+VITE_VIDEO_FALLBACK_TRANSPORT=wsjpeg
 ```
 
 ## 5) Janus internet reachability requirements
@@ -134,6 +130,6 @@ Expected:
 ## 8) Live validation
 - Open Vercel URL.
 - Live badge should show:
-  - `Video: DIRECT` or `Video: JANUS`
+  - `Video: JANUS` (or `Video: WSJPEG` only during degraded fallback)
   - `Metadata: OPEN`
 - Overlay boxes should update continuously.

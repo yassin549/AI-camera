@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import {
-  postWebRtcOffer,
   resolveMetadataLatestUrl,
   resolveMetadataWsUrl,
   withApiKeyHeaders,
@@ -20,15 +19,14 @@ interface VideoCanvasProps {
   metadataLatestUrl?: string;
   janusHttpUrl?: string;
   janusMountpoint?: number;
-  directStreamUrl?: string;
-  directStreamKind?: "auto" | "video" | "image";
   disableBackendVideo?: boolean;
   disableJanus?: boolean;
   onTrackFocus?: (track: TrackPayload | null) => void;
   onRosterChange?: (tracks: TrackPayload[]) => void;
 }
 
-type TransportMode = "connecting" | "direct" | "janus" | "webrtc" | "wsjpeg" | "mjpeg" | "error";
+type TransportMode = "connecting" | "janus" | "wsjpeg" | "error";
+type TransportCandidate = "janus" | "wsjpeg";
 
 interface ProjectedTrack {
   track: TrackPayload;
@@ -55,8 +53,6 @@ interface RosterEmitCache {
   key: string;
   at: number;
 }
-
-type DirectStreamKind = "auto" | "video" | "image";
 
 const THUMB_SIZE = 34;
 
@@ -149,12 +145,13 @@ function computeTracksKey(payload: MetadataPayload | null): string {
   if (!payload || payload.tracks.length === 0) {
     return "none";
   }
-  return payload.tracks
+  const trackKey = payload.tracks
     .map((track) => {
-      const [x, y, w, h] = track.bbox;
-      return `${track.track_id}:${x},${y},${w},${h}:${track.identity_id ?? "n"}:${track.label}`;
+      const [x1, y1, x2, y2] = track.bbox;
+      return `${track.track_id}:${x1},${y1},${x2},${y2}:${track.identity_id ?? "n"}:${track.label}:${track.muted ? 1 : 0}:${track.age_frames ?? 0}`;
     })
     .join("|");
+  return `${payload.frame_id}:${trackKey}`;
 }
 
 function computeRosterKey(tracks: TrackPayload[]): string {
@@ -162,44 +159,25 @@ function computeRosterKey(tracks: TrackPayload[]): string {
     return "none";
   }
   return tracks
-    .map((track) => `${track.track_id}:${track.identity_id ?? "n"}:${track.label}`)
+    .map((track) => `${track.track_id}:${track.identity_id ?? "n"}:${track.label}:${track.muted ? 1 : 0}`)
     .join("|");
 }
 
-function inferDirectStreamKind(url: string, explicit: DirectStreamKind): "video" | "image" {
-  if (explicit === "video" || explicit === "image") {
-    return explicit;
+function percentile(values: number[], p: number): number | null {
+  if (!values.length) {
+    return null;
   }
-  const normalized = url.toLowerCase();
-  if (
-    normalized.includes(".mjpg") ||
-    normalized.includes(".mjpeg") ||
-    normalized.includes("/mjpeg") ||
-    normalized.includes("multipart/x-mixed-replace")
-  ) {
-    return "image";
-  }
-  return "video";
+  const sorted = [...values].sort((a, b) => a - b);
+  const clamped = Math.max(0, Math.min(100, p));
+  const rank = (clamped / 100) * (sorted.length - 1);
+  const lo = Math.floor(rank);
+  const hi = Math.min(sorted.length - 1, lo + 1);
+  const frac = rank - lo;
+  return sorted[lo] * (1 - frac) + sorted[hi] * frac;
 }
 
-async function waitForIceGatheringComplete(pc: RTCPeerConnection, timeoutMs = 2000): Promise<void> {
-  if (pc.iceGatheringState === "complete") {
-    return;
-  }
-  await new Promise<void>((resolve) => {
-    const timeout = window.setTimeout(() => {
-      pc.removeEventListener("icegatheringstatechange", onStateChange);
-      resolve();
-    }, timeoutMs);
-    const onStateChange = () => {
-      if (pc.iceGatheringState === "complete") {
-        window.clearTimeout(timeout);
-        pc.removeEventListener("icegatheringstatechange", onStateChange);
-        resolve();
-      }
-    };
-    pc.addEventListener("icegatheringstatechange", onStateChange);
-  });
+function transportLabel(transport: TransportCandidate): string {
+  return transport === "wsjpeg" ? "WS-JPEG" : "JANUS";
 }
 
 export function VideoCanvas({
@@ -211,8 +189,6 @@ export function VideoCanvas({
   metadataLatestUrl,
   janusHttpUrl = API.JANUS_HTTP,
   janusMountpoint = API.JANUS_MOUNTPOINT,
-  directStreamUrl = API.DIRECT_STREAM_URL,
-  directStreamKind = API.DIRECT_STREAM_KIND as DirectStreamKind,
   disableBackendVideo = API.DISABLE_BACKEND_VIDEO,
   disableJanus = API.DISABLE_JANUS,
   onTrackFocus,
@@ -233,20 +209,14 @@ export function VideoCanvas({
     const separator = base.includes("?") ? "&" : "?";
     return withApiKeyQuery(`${base}${separator}fps=${remoteFps}`);
   }, []);
-  const resolvedMjpegUrl = useMemo(() => withApiKeyQuery(resolveApiUrl("/api/media/mjpeg")), []);
-  const resolvedDirectStreamUrl = useMemo(
-    () => (directStreamUrl ? withApiKeyQuery(resolveApiUrl(directStreamUrl)) : ""),
-    [directStreamUrl]
-  );
-  const resolvedDirectStreamKind = useMemo<DirectStreamKind>(() => {
-    if (directStreamKind === "image" || directStreamKind === "video") {
-      return directStreamKind;
-    }
-    return "auto";
-  }, [directStreamKind]);
   const resolvedJanusMountpoint = useMemo(
     () => (Number.isFinite(janusMountpoint) && Number(janusMountpoint) > 0 ? Number(janusMountpoint) : 1),
     [janusMountpoint]
+  );
+  const configuredTransportPlan = API.VIDEO_TRANSPORT_PLAN as readonly TransportCandidate[];
+  const configuredTransportPlanLabel = useMemo(
+    () => (configuredTransportPlan.length ? configuredTransportPlan.map((item) => transportLabel(item)).join(" -> ") : "NONE"),
+    [configuredTransportPlan]
   );
   const authHeaders = useMemo(() => withApiKeyHeaders(), []);
   const disableWebRtc = (import.meta.env.VITE_DISABLE_WEBRTC as string | undefined) === "true";
@@ -259,11 +229,20 @@ export function VideoCanvas({
   const latestMetadataRef = useRef<MetadataPayload | null>(null);
   const drawCacheRef = useRef<DrawCache>({ tracksKey: "", sizeKey: "", focusedTrackId: null });
   const rosterEmitRef = useRef<RosterEmitCache>({ key: "", at: 0 });
+  const rosterPendingRef = useRef<TrackPayload[] | null>(null);
+  const rosterFlushTimerRef = useRef<number | null>(null);
   const metricsRef = useRef<CanvasMetrics>({ cssWidth: 0, cssHeight: 0, sourceWidth: 0, sourceHeight: 0 });
-  const resizeKeyRef = useRef(0);
-  const rafRef = useRef<number | null>(null);
+  const containerSizeRef = useRef<{ width: number; height: number }>({ width: 1, height: 1 });
+  const drawRafRef = useRef<number | null>(null);
+  const drawScheduledRef = useRef(false);
+  const requestDrawRef = useRef<() => void>(() => undefined);
+  const metadataLagSamplesRef = useRef<number[]>([]);
+  const overlayIntervalsRef = useRef<number[]>([]);
+  const lastOverlayDrawAtRef = useRef<number | null>(null);
+  const janusConnectStartedAtRef = useRef<number | null>(null);
+  const janusTtffMsRef = useRef<number | null>(null);
+  const perfPostInflightRef = useRef(false);
   const janusPcRef = useRef<RTCPeerConnection | null>(null);
-  const apiWebRtcPcRef = useRef<RTCPeerConnection | null>(null);
   const wsJpegSocketRef = useRef<WebSocket | null>(null);
   const wsJpegObjectUrlRef = useRef<string | null>(null);
   const janusAbortRef = useRef<AbortController | null>(null);
@@ -292,13 +271,37 @@ export function VideoCanvas({
         tracks: resolvedTracks
       };
       latestMetadataRef.current = resolvedPayload;
+      const captureTsUnix = Number(resolvedPayload.capture_ts_unix ?? NaN);
+      const payloadLagMs = Number(resolvedPayload.metadata_lag_ms ?? NaN);
+      let estimatedLagMs: number | null = null;
+      if (Number.isFinite(captureTsUnix) && captureTsUnix > 0) {
+        estimatedLagMs = Date.now() - captureTsUnix * 1000;
+      } else if (Number.isFinite(payloadLagMs) && payloadLagMs >= 0) {
+        estimatedLagMs = payloadLagMs;
+      }
+      if (estimatedLagMs !== null && Number.isFinite(estimatedLagMs) && estimatedLagMs >= 0 && estimatedLagMs < 120000) {
+        const next = metadataLagSamplesRef.current;
+        next.push(estimatedLagMs);
+        if (next.length > 256) {
+          next.splice(0, next.length - 256);
+        }
+      }
+      requestDrawRef.current();
       if (onRosterChange) {
-        const nextKey = computeRosterKey(resolvedTracks);
-        const now = performance.now();
-        const prev = rosterEmitRef.current;
-        if (nextKey !== prev.key || now - prev.at >= 200) {
-          rosterEmitRef.current = { key: nextKey, at: now };
-          onRosterChange(resolvedTracks);
+        rosterPendingRef.current = resolvedTracks;
+        if (rosterFlushTimerRef.current === null) {
+          rosterFlushTimerRef.current = window.setTimeout(() => {
+            rosterFlushTimerRef.current = null;
+            const tracks = rosterPendingRef.current ?? [];
+            rosterPendingRef.current = null;
+            const nextKey = computeRosterKey(tracks);
+            const now = performance.now();
+            const prev = rosterEmitRef.current;
+            if (nextKey !== prev.key || now - prev.at >= 300) {
+              rosterEmitRef.current = { key: nextKey, at: now };
+              onRosterChange(tracks);
+            }
+          }, 120);
         }
       }
     }
@@ -314,6 +317,7 @@ export function VideoCanvas({
       abort.abort();
       janusAbortRef.current = null;
     }
+    janusConnectStartedAtRef.current = null;
     const janusPc = janusPcRef.current;
     if (!janusPc) {
       // continue: session may still need cleanup.
@@ -322,13 +326,6 @@ export function VideoCanvas({
       janusPc.onicecandidate = null;
       janusPc.close();
       janusPcRef.current = null;
-    }
-    const apiWebRtcPc = apiWebRtcPcRef.current;
-    if (apiWebRtcPc) {
-      apiWebRtcPc.ontrack = null;
-      apiWebRtcPc.onicecandidate = null;
-      apiWebRtcPc.close();
-      apiWebRtcPcRef.current = null;
     }
     const wsJpegSocket = wsJpegSocketRef.current;
     if (wsJpegSocket) {
@@ -418,82 +415,6 @@ export function VideoCanvas({
       mjpeg.src = url;
     };
 
-    const startDirectStreamTransport = async (): Promise<{ ok: boolean; error: string }> => {
-      if (!resolvedDirectStreamUrl) {
-        return { ok: false, error: "No direct stream URL configured" };
-      }
-      const inferredKind = inferDirectStreamKind(resolvedDirectStreamUrl, resolvedDirectStreamKind);
-      if (inferredKind === "image") {
-        const loaded = await new Promise<boolean>((resolve) => {
-          const timeout = window.setTimeout(() => {
-            mjpeg.onload = null;
-            mjpeg.onerror = null;
-            resolve(false);
-          }, 5000);
-          mjpeg.onload = () => {
-            window.clearTimeout(timeout);
-            mjpeg.onload = null;
-            mjpeg.onerror = null;
-            resolve(true);
-          };
-          mjpeg.onerror = () => {
-            window.clearTimeout(timeout);
-            mjpeg.onload = null;
-            mjpeg.onerror = null;
-            resolve(false);
-          };
-          showMjpeg(resolvedDirectStreamUrl);
-        });
-        if (!loaded) {
-          hideMjpeg();
-          return { ok: false, error: "Direct image stream did not start" };
-        }
-        transportModeRef.current = "direct";
-        setTransportMode("direct");
-        setTransportError(null);
-        return { ok: true, error: "" };
-      }
-
-      hideMjpeg();
-      video.pause();
-      video.srcObject = null;
-      video.removeAttribute("src");
-      video.style.display = "block";
-      const loaded = await new Promise<boolean>((resolve) => {
-        const timeout = window.setTimeout(() => {
-          video.onloadeddata = null;
-          video.onerror = null;
-          resolve(false);
-        }, 6000);
-        video.onloadeddata = () => {
-          window.clearTimeout(timeout);
-          video.onloadeddata = null;
-          video.onerror = null;
-          resolve(true);
-        };
-        video.onerror = () => {
-          window.clearTimeout(timeout);
-          video.onloadeddata = null;
-          video.onerror = null;
-          resolve(false);
-        };
-        video.src = resolvedDirectStreamUrl;
-        void video.play().catch(() => undefined);
-      });
-      if (!loaded) {
-        video.pause();
-        video.removeAttribute("src");
-        const hint = /^rtsp:\/\//i.test(resolvedDirectStreamUrl)
-          ? "Browser cannot decode raw RTSP. Use Janus/HLS gateway URL."
-          : "Direct video stream did not start";
-        return { ok: false, error: hint };
-      }
-      transportModeRef.current = "direct";
-      setTransportMode("direct");
-      setTransportError(null);
-      return { ok: true, error: "" };
-    };
-
     const janusPost = async (
       path: string,
       body: Record<string, unknown>,
@@ -520,6 +441,8 @@ export function VideoCanvas({
     };
 
     const startJanusTransport = async (): Promise<{ ok: boolean; error: string }> => {
+      janusConnectStartedAtRef.current = performance.now();
+      janusTtffMsRef.current = null;
       if (!resolvedJanusHttpUrl || typeof RTCPeerConnection === "undefined") {
         return { ok: false, error: "Janus endpoint or browser WebRTC unavailable" };
       }
@@ -559,6 +482,9 @@ export function VideoCanvas({
             showVideo();
             video.srcObject = event.streams[0];
             video.play().catch(() => undefined);
+            if (janusTtffMsRef.current === null && janusConnectStartedAtRef.current !== null) {
+              janusTtffMsRef.current = Math.max(0, performance.now() - janusConnectStartedAtRef.current);
+            }
             transportModeRef.current = "janus";
             setTransportMode("janus");
             setTransportError(null);
@@ -675,115 +601,6 @@ export function VideoCanvas({
       }
     };
 
-    const startApiWebRtcTransport = async (): Promise<{ ok: boolean; error: string }> => {
-      if (typeof RTCPeerConnection === "undefined") {
-        return { ok: false, error: "Browser WebRTC unavailable" };
-      }
-      try {
-        const pc = new RTCPeerConnection();
-        apiWebRtcPcRef.current = pc;
-        const firstTrack = new Promise<boolean>((resolve) => {
-          const timeout = window.setTimeout(() => resolve(false), 7000);
-          pc.ontrack = (event) => {
-            if (!event.streams[0]) {
-              return;
-            }
-            window.clearTimeout(timeout);
-            showVideo();
-            video.srcObject = event.streams[0];
-            video.play().catch(() => undefined);
-            transportModeRef.current = "webrtc";
-            setTransportMode("webrtc");
-            setTransportError(null);
-            resolve(true);
-          };
-        });
-
-        pc.addTransceiver("video", { direction: "recvonly" });
-        const offer = await pc.createOffer();
-        await pc.setLocalDescription(offer);
-        await waitForIceGatheringComplete(pc, 2000);
-        const local = pc.localDescription;
-        if (!local?.sdp) {
-          throw new Error("Local WebRTC offer is empty");
-        }
-        const answer = await postWebRtcOffer({ sdp: local.sdp, type: "offer" });
-        await pc.setRemoteDescription(answer as RTCSessionDescriptionInit);
-        const gotTrack = await firstTrack;
-        if (!gotTrack) {
-          throw new Error("No media track received");
-        }
-        return { ok: true, error: "" };
-      } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : "API WebRTC negotiation failed";
-        closeTransport();
-        return { ok: false, error: message };
-      }
-    };
-
-    const startMjpegTransport = async (): Promise<{ ok: boolean; error: string }> => {
-      const separator = resolvedMjpegUrl.includes("?") ? "&" : "?";
-      const probeUrl = `${resolvedMjpegUrl}${separator}probe=1&_=${Date.now()}`;
-      const probeAbort = new AbortController();
-      const timeoutId = window.setTimeout(() => probeAbort.abort(), 3000);
-      try {
-        const response = await fetch(probeUrl, {
-          method: "GET",
-          headers: withApiKeyHeaders(),
-          signal: probeAbort.signal
-        });
-        window.clearTimeout(timeoutId);
-        if (!response.ok) {
-          let details = "";
-          try {
-            details = await response.text();
-          } catch {
-            details = "";
-          }
-          return {
-            ok: false,
-            error: details ? `HTTP ${response.status}: ${details}` : `HTTP ${response.status}`,
-          };
-        }
-        void response.body?.cancel().catch(() => undefined);
-      } catch (err: unknown) {
-        window.clearTimeout(timeoutId);
-        const message = err instanceof Error ? err.message : "MJPEG probe failed";
-        return { ok: false, error: message };
-      }
-
-      const streamUrl = `${resolvedMjpegUrl}${separator}stream=1&_=${Date.now()}`;
-      const loaded = await new Promise<boolean>((resolve) => {
-        const timeout = window.setTimeout(() => {
-          mjpeg.onload = null;
-          mjpeg.onerror = null;
-          resolve(false);
-        }, 5000);
-        mjpeg.onload = () => {
-          window.clearTimeout(timeout);
-          mjpeg.onload = null;
-          mjpeg.onerror = null;
-          resolve(true);
-        };
-        mjpeg.onerror = () => {
-          window.clearTimeout(timeout);
-          mjpeg.onload = null;
-          mjpeg.onerror = null;
-          resolve(false);
-        };
-        showMjpeg(streamUrl);
-      });
-
-      if (!loaded) {
-        hideMjpeg();
-        return { ok: false, error: "MJPEG stream did not start" };
-      }
-      transportModeRef.current = "mjpeg";
-      setTransportMode("mjpeg");
-      setTransportError(null);
-      return { ok: true, error: "" };
-    };
-
     const startWsJpegTransport = async (): Promise<{ ok: boolean; error: string }> => {
       if (typeof WebSocket === "undefined" || !resolvedWsJpegUrl) {
         return { ok: false, error: "Browser WebSocket unavailable" };
@@ -806,7 +623,7 @@ export function VideoCanvas({
 
           socket.onmessage = (event) => {
             const now = performance.now();
-            if (now - lastRenderedAt < 80) {
+            if (now - lastRenderedAt < 90) {
               return;
             }
             lastRenderedAt = now;
@@ -852,78 +669,47 @@ export function VideoCanvas({
       }
     };
 
+    const attemptTransport = async (candidate: TransportCandidate): Promise<{ ok: boolean; error: string }> => {
+      if (candidate === "janus") {
+        if (disableWebRtc) {
+          return { ok: false, error: "WebRTC disabled by VITE_DISABLE_WEBRTC=true" };
+        }
+        if (disableJanus) {
+          return { ok: false, error: "Janus disabled by VITE_DISABLE_JANUS=true" };
+        }
+        return startJanusTransport();
+      }
+      if (disableBackendVideo) {
+        return { ok: false, error: "Backend video disabled by VITE_DISABLE_BACKEND_VIDEO=true" };
+      }
+      return startWsJpegTransport();
+    };
+
     const bootstrapVideo = async () => {
       setTransportError(null);
       transportModeRef.current = "connecting";
       setTransportMode("connecting");
 
       const failures: string[] = [];
-      if (resolvedDirectStreamUrl) {
-        const directReady = await startDirectStreamTransport();
+      if (!configuredTransportPlan.length) {
+        failures.push("No transports configured");
+      }
+
+      for (const candidate of configuredTransportPlan) {
+        const result = await attemptTransport(candidate);
         if (cancelled) {
           return;
         }
-        if (directReady.ok) {
+        if (result.ok) {
           return;
         }
-        failures.push(`Direct stream: ${directReady.error}`);
-      }
-      if (!disableWebRtc) {
-        if (!disableJanus) {
-          const janusReady = await startJanusTransport();
-          if (cancelled) {
-            return;
-          }
-          if (janusReady.ok) {
-            return;
-          }
-          failures.push(`Janus: ${janusReady.error}`);
-        } else {
-          failures.push("Janus disabled by VITE_DISABLE_JANUS=true");
-        }
-
-        if (!disableBackendVideo) {
-          const apiWebRtcReady = await startApiWebRtcTransport();
-          if (cancelled) {
-            return;
-          }
-          if (apiWebRtcReady.ok) {
-            return;
-          }
-          failures.push(`API WebRTC: ${apiWebRtcReady.error}`);
-        } else {
-          failures.push("API WebRTC disabled by VITE_DISABLE_BACKEND_VIDEO=true");
-        }
-      } else {
-        failures.push("WebRTC disabled by VITE_DISABLE_WEBRTC=true");
+        failures.push(`${transportLabel(candidate)}: ${result.error}`);
       }
 
-      if (disableBackendVideo) {
-        failures.push("MJPEG disabled by VITE_DISABLE_BACKEND_VIDEO=true");
-        transportModeRef.current = "error";
-        setTransportMode("error");
-        setTransportError(failures.join(" | "));
-        return;
-      }
-      const wsJpegReady = await startWsJpegTransport();
-      if (cancelled) {
-        return;
-      }
-      if (wsJpegReady.ok) {
-        return;
-      }
-      failures.push(`WS-JPEG: ${wsJpegReady.error}`);
-      const mjpegReady = await startMjpegTransport();
-      if (cancelled) {
-        return;
-      }
-      if (mjpegReady.ok) {
-        return;
-      }
-      failures.push(`MJPEG: ${mjpegReady.error}`);
       transportModeRef.current = "error";
       setTransportMode("error");
-      setTransportError(failures.join(" | "));
+      const details = failures.join(" | ");
+      setTransportError(`Plan ${configuredTransportPlanLabel} | ${details}`);
     };
 
     bootstrapVideo();
@@ -934,15 +720,14 @@ export function VideoCanvas({
     };
   }, [
     active,
+    configuredTransportPlan,
+    configuredTransportPlanLabel,
     disableBackendVideo,
     disableJanus,
     disableWebRtc,
-    resolvedDirectStreamKind,
-    resolvedDirectStreamUrl,
     resolvedJanusHttpUrl,
     resolvedJanusMountpoint,
-    resolvedWsJpegUrl,
-    resolvedMjpegUrl
+    resolvedWsJpegUrl
   ]);
 
   useEffect(() => {
@@ -981,39 +766,92 @@ export function VideoCanvas({
 
   useEffect(() => {
     if (!active) {
+      if (rosterFlushTimerRef.current !== null) {
+        window.clearTimeout(rosterFlushTimerRef.current);
+        rosterFlushTimerRef.current = null;
+      }
       latestMetadataRef.current = null;
       drawCacheRef.current = { tracksKey: "", sizeKey: "", focusedTrackId: null };
       rosterEmitRef.current = { key: "", at: 0 };
+      rosterPendingRef.current = null;
+      metadataLagSamplesRef.current = [];
+      overlayIntervalsRef.current = [];
+      lastOverlayDrawAtRef.current = null;
+      janusConnectStartedAtRef.current = null;
+      janusTtffMsRef.current = null;
       onTrackFocus?.(null);
       onRosterChange?.([]);
+      requestDrawRef.current();
     }
   }, [active, onTrackFocus, onRosterChange]);
+
+  useEffect(() => {
+    return () => {
+      if (rosterFlushTimerRef.current !== null) {
+        window.clearTimeout(rosterFlushTimerRef.current);
+        rosterFlushTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) {
       return;
     }
-    const observer = new ResizeObserver(() => {
-      resizeKeyRef.current += 1;
+    const updateSize = (width: number, height: number) => {
+      const nextWidth = Math.max(1, Math.round(width));
+      const nextHeight = Math.max(1, Math.round(height));
+      const prev = containerSizeRef.current;
+      if (prev.width === nextWidth && prev.height === nextHeight) {
+        return;
+      }
+      containerSizeRef.current = { width: nextWidth, height: nextHeight };
+      requestDrawRef.current();
+    };
+    const observer = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        if (entry.target !== container) {
+          continue;
+        }
+        updateSize(entry.contentRect.width, entry.contentRect.height);
+      }
     });
     observer.observe(container);
+    const initialRect = container.getBoundingClientRect();
+    updateSize(initialRect.width, initialRect.height);
     return () => observer.disconnect();
   }, []);
 
   useEffect(() => {
-    const draw = () => {
+    const video = videoRef.current;
+    const mjpeg = mjpegRef.current;
+    const handleMediaResize = () => {
+      requestDrawRef.current();
+    };
+    video?.addEventListener("loadedmetadata", handleMediaResize);
+    video?.addEventListener("loadeddata", handleMediaResize);
+    video?.addEventListener("resize", handleMediaResize);
+    mjpeg?.addEventListener("load", handleMediaResize);
+    return () => {
+      video?.removeEventListener("loadedmetadata", handleMediaResize);
+      video?.removeEventListener("loadeddata", handleMediaResize);
+      video?.removeEventListener("resize", handleMediaResize);
+      mjpeg?.removeEventListener("load", handleMediaResize);
+    };
+  }, []);
+
+  useEffect(() => {
+    const drawNow = () => {
       const canvas = canvasRef.current;
-      const video = videoRef.current;
-      const container = containerRef.current;
-      if (!canvas || !container) {
-        rafRef.current = window.requestAnimationFrame(draw);
+      if (!canvas) {
         return;
       }
-
-      // Determine source dimensions from the active video element
+      const cssWidth = Math.max(1, containerSizeRef.current.width);
+      const cssHeight = Math.max(1, containerSizeRef.current.height);
       let nativeW = 0;
       let nativeH = 0;
+      const video = videoRef.current;
       if (video) {
         nativeW = video.videoWidth;
         nativeH = video.videoHeight;
@@ -1023,16 +861,12 @@ export function VideoCanvas({
         nativeH = mjpegRef.current.naturalHeight;
       }
 
-      const rect = container.getBoundingClientRect();
-      const cssWidth = Math.max(1, Math.round(rect.width));
-      const cssHeight = Math.max(1, Math.round(rect.height));
       const latest = latestMetadataRef.current;
       const metadataSourceWidth = Number(latest?.source_width ?? 0);
       const metadataSourceHeight = Number(latest?.source_height ?? 0);
       const sourceWidth = Math.max(1, Math.round(metadataSourceWidth > 0 ? metadataSourceWidth : nativeW || cssWidth));
       const sourceHeight = Math.max(1, Math.round(metadataSourceHeight > 0 ? metadataSourceHeight : nativeH || cssHeight));
       const dpr = window.devicePixelRatio || 1;
-
       const bufferWidth = pixelPerfect ? Math.round(sourceWidth * dpr) : Math.round(cssWidth * dpr);
       const bufferHeight = pixelPerfect ? Math.round(sourceHeight * dpr) : Math.round(cssHeight * dpr);
 
@@ -1050,40 +884,29 @@ export function VideoCanvas({
 
       const ctx = canvas.getContext("2d");
       if (!ctx) {
-        rafRef.current = window.requestAnimationFrame(draw);
         return;
       }
       ctx.setTransform(canvas.width / cssWidth, 0, 0, canvas.height / cssHeight, 0, 0);
       ctx.imageSmoothingEnabled = true;
-
-      metricsRef.current = {
-        cssWidth,
-        cssHeight,
-        sourceWidth,
-        sourceHeight
-      };
+      metricsRef.current = { cssWidth, cssHeight, sourceWidth, sourceHeight };
 
       const tracksKey = computeTracksKey(latest);
-      const sizeKey = `${cssWidth}x${cssHeight}:${sourceWidth}x${sourceHeight}:${resizeKeyRef.current}:${pixelPerfect ? "pp" : "fit"}`;
+      const sizeKey = `${cssWidth}x${cssHeight}:${sourceWidth}x${sourceHeight}:${pixelPerfect ? "pp" : "fit"}`;
       const cache = drawCacheRef.current;
       const shouldDraw =
         cache.tracksKey !== tracksKey ||
         cache.sizeKey !== sizeKey ||
         cache.focusedTrackId !== focusedTrackId;
-      if (!shouldDraw || !active) {
-        rafRef.current = window.requestAnimationFrame(draw);
+      if (!shouldDraw) {
         return;
       }
-
       cache.tracksKey = tracksKey;
       cache.sizeKey = sizeKey;
       cache.focusedTrackId = focusedTrackId;
 
       ctx.clearRect(0, 0, cssWidth, cssHeight);
       projectedTracksRef.current = [];
-
-      if (!latest || sourceWidth < 2 || sourceHeight < 2) {
-        rafRef.current = window.requestAnimationFrame(draw);
+      if (!active || !latest || sourceWidth < 2 || sourceHeight < 2) {
         return;
       }
 
@@ -1103,10 +926,8 @@ export function VideoCanvas({
           console.error("Invalid bbox(xyxy) received from metadata stream", { bbox: track.bbox, trackId: track.track_id });
           continue;
         }
-        const bx = x1;
-        const by = y1;
-        const x = offsetX + bx * scaleX;
-        const y = offsetY + by * scaleY;
+        const x = offsetX + x1 * scaleX;
+        const y = offsetY + y1 * scaleY;
         const w = bw * scaleX;
         const h = bh * scaleY;
         if (w <= 1 || h <= 1) {
@@ -1114,16 +935,21 @@ export function VideoCanvas({
         }
 
         const isFocused = focusedTrackId !== null && focusedTrackId === track.track_id;
+        const isMuted = Boolean(track.muted);
         const ageRatio = Math.max(0, Math.min(1, Number(track.age_ratio ?? 0)));
         const freshness = 1 - ageRatio;
         const strokeAlpha = isFocused ? 1 : 0.35 + freshness * 0.6;
         const fillAlpha = isFocused ? 0.13 : 0.05 + freshness * 0.11;
         const accent = isFocused
           ? "rgba(255, 198, 89, 1)"
-          : `rgba(124, 92, 255, ${Math.max(0.2, Math.min(1, strokeAlpha)).toFixed(3)})`;
+          : isMuted
+            ? `rgba(148, 163, 184, ${Math.max(0.2, Math.min(1, strokeAlpha)).toFixed(3)})`
+            : `rgba(124, 92, 255, ${Math.max(0.2, Math.min(1, strokeAlpha)).toFixed(3)})`;
         const fill = isFocused
           ? "rgba(255, 198, 89, 0.13)"
-          : `rgba(124, 92, 255, ${Math.max(0.03, Math.min(0.25, fillAlpha)).toFixed(3)})`;
+          : isMuted
+            ? `rgba(148, 163, 184, ${Math.max(0.03, Math.min(0.25, fillAlpha)).toFixed(3)})`
+            : `rgba(124, 92, 255, ${Math.max(0.03, Math.min(0.25, fillAlpha)).toFixed(3)})`;
 
         ctx.fillStyle = fill;
         ctx.strokeStyle = accent;
@@ -1145,16 +971,87 @@ export function VideoCanvas({
         projectedTracksRef.current.push({ track, x, y, w, h });
       }
 
-      rafRef.current = window.requestAnimationFrame(draw);
+      const nowMs = performance.now();
+      if (lastOverlayDrawAtRef.current !== null && nowMs > lastOverlayDrawAtRef.current) {
+        const deltaMs = nowMs - lastOverlayDrawAtRef.current;
+        const intervals = overlayIntervalsRef.current;
+        intervals.push(deltaMs);
+        if (intervals.length > 256) {
+          intervals.splice(0, intervals.length - 256);
+        }
+      }
+      lastOverlayDrawAtRef.current = nowMs;
     };
 
-    rafRef.current = window.requestAnimationFrame(draw);
+    const requestDraw = () => {
+      if (drawScheduledRef.current) {
+        return;
+      }
+      drawScheduledRef.current = true;
+      drawRafRef.current = window.requestAnimationFrame(() => {
+        drawScheduledRef.current = false;
+        drawRafRef.current = null;
+        drawNow();
+      });
+    };
+    requestDrawRef.current = requestDraw;
+    requestDraw();
+
     return () => {
-      if (rafRef.current !== null) {
-        window.cancelAnimationFrame(rafRef.current);
+      requestDrawRef.current = () => undefined;
+      drawScheduledRef.current = false;
+      if (drawRafRef.current !== null) {
+        window.cancelAnimationFrame(drawRafRef.current);
+        drawRafRef.current = null;
       }
     };
   }, [active, focusedTrackId, pixelPerfect]);
+
+  useEffect(() => {
+    if (!active) {
+      return;
+    }
+    const perfUrl = resolveApiUrl("/api/perf/client");
+    const timer = window.setInterval(() => {
+      const intervals = overlayIntervalsRef.current;
+      const metadataLagP95 = percentile(metadataLagSamplesRef.current, 95);
+      const overlayAvgMs = intervals.length ? intervals.reduce((sum, value) => sum + value, 0) / intervals.length : null;
+      const overlayFps = overlayAvgMs && overlayAvgMs > 0 ? 1000 / overlayAvgMs : null;
+      const overlayJankRatio = intervals.length
+        ? intervals.filter((value) => value > 50).length / intervals.length
+        : null;
+      const janusTtffMs = janusTtffMsRef.current;
+      const payload: Record<string, number> = {};
+      if (metadataLagP95 !== null && Number.isFinite(metadataLagP95)) {
+        payload.metadata_lag_ms_p95 = metadataLagP95;
+      }
+      if (overlayFps !== null && Number.isFinite(overlayFps)) {
+        payload.overlay_fps = overlayFps;
+      }
+      if (overlayJankRatio !== null && Number.isFinite(overlayJankRatio)) {
+        payload.overlay_jank_ratio = overlayJankRatio;
+      }
+      if (janusTtffMs !== null && Number.isFinite(janusTtffMs)) {
+        payload.janus_ttff_ms = janusTtffMs;
+      }
+      if (Object.keys(payload).length === 0 || perfPostInflightRef.current) {
+        return;
+      }
+      perfPostInflightRef.current = true;
+      const headers = withApiKeyHeaders(authHeaders);
+      headers.set("Content-Type", "application/json");
+      void fetch(perfUrl, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(payload)
+      }).finally(() => {
+        perfPostInflightRef.current = false;
+      });
+    }, 2000);
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [active, authHeaders]);
 
   const handleCanvasClick = (event: MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
@@ -1201,6 +1098,7 @@ export function VideoCanvas({
         <span className="h-2 w-2 rounded-full bg-emerald-400" />
         <span>Video: {transportMode.toUpperCase()}</span>
         <span>Metadata: {realtime.status.toUpperCase()}</span>
+        <span>Plan: {configuredTransportPlanLabel}</span>
       </div>
       {transportError ? (
         <div className="pointer-events-none absolute right-3 top-3 rounded-lg bg-amber-300/90 px-3 py-2 text-xs font-medium text-slate-950 shadow-soft">

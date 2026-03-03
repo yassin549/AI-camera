@@ -1,0 +1,26 @@
+Phase 1 Prompt:
+"Define hard performance SLOs and a measurable baseline for this codebase. Create explicit numeric targets for detector FPS, tracker FPS, stage p95 timings, local/remote video latency, metadata freshness, and identity thumbnail load time. Add machine-readable target definitions and a repeatable command that reports pass/fail against current runtime metrics."
+
+Phase 2 Prompt:
+"Build a repeatable benchmark harness that runs for a fixed duration, captures p50/p95 metrics for each stage, records transport behavior, and outputs a comparable report file so we can track regression/improvement across commits."
+
+Phase 3 Prompt:
+"Refactor video transport to one primary remote path (WebRTC with proper ICE/TURN and stable domain) and one explicit degraded fallback path. Remove ambiguous multi-path races and make transport selection deterministic with clear observability."
+
+Phase 4 Prompt:
+"Optimize detection/inference path first: improve model runtime settings, reduce unnecessary full-frame inference, and add load-aware resolution/frequency controls so detector FPS reaches target while preserving identity quality."
+
+Phase 5 Prompt:
+"Decouple recognition and database writes from the hot tracking loop. Introduce buffered queues/batching and async persistence so identity updates do not stall frame processing."
+
+Phase 6 Prompt:
+"Optimize degraded remote streaming path (WS-JPEG/MJPEG) for stability under variable bandwidth using frame dropping, adaptive quality/fps, and strict backpressure handling to minimize latency accumulation."
+
+Phase 7 Prompt:
+"Refactor identity media delivery into dedicated thumbnail assets with predictable URLs and cache policy. Ensure library page uses small thumbnails and detail page lazily loads full samples."
+
+Phase 8 Prompt:
+"Optimize frontend rendering pipeline by reducing React re-render pressure, isolating high-frequency drawing to canvas/offscreen workers where appropriate, and tracking UI frame pacing + metadata lag."
+
+Phase 9 Prompt:
+"Add performance regression gates: codify benchmark thresholds, automate checks in CI/local scripts, and fail when p95 latency/FPS thresholds regress beyond allowed bounds."

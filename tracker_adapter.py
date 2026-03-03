@@ -103,6 +103,7 @@ class TrackerAdapter:
         self.fallback = None
         self._latest_tracks: List[Track] = []
         self._last_detections: List[Track] = []
+        self._track_features: Dict[int, np.ndarray] = {}
         self._last_update_ts = time.time()
 
         if sv is not None:
@@ -135,44 +136,38 @@ class TrackerAdapter:
             assert self.fallback is not None
             tracked = self.fallback.update(detections)
 
+        self._refresh_track_feature_cache(tracked)
         self._latest_tracks = tracked[: self.max_tracks]
         return list(self._latest_tracks)
 
     def predict(self) -> List[Track]:
         """Advance tracker on non-detection frames without starving tracker state."""
         if self.bytetrack is not None:
-            propagated: List[Track] = []
-            if self._latest_tracks:
-                propagated = [
+            # Let ByteTrack run its own motion model when no fresh detections are available.
+            tracked = self._run_bytetrack([])
+            if not tracked and self._latest_tracks:
+                # Defensive fallback for supervision versions that return no tracks on empty updates.
+                tracked = [
                     Track(
                         track_id=int(tr.track_id),
                         bbox=tuple(tr.bbox),
-                        score=max(0.05, float(tr.score) * 0.98),
+                        score=max(0.05, float(tr.score) * 0.97),
                         feature=tr.feature,
                     )
                     for tr in self._latest_tracks
                 ]
-            elif self._last_detections:
-                propagated = [
-                    Track(
-                        track_id=-1,
-                        bbox=tuple(det.bbox),
-                        score=max(0.05, float(det.score) * 0.96),
-                        feature=det.feature,
-                    )
-                    for det in self._last_detections
-                ]
-
-            # Only send an empty update when there is truly no scene evidence.
-            tracked = self._run_bytetrack(propagated if propagated else [])
         else:
             assert self.fallback is not None
             tracked = self.fallback.predict()
+        self._refresh_track_feature_cache(tracked)
         self._latest_tracks = tracked[: self.max_tracks]
         return list(self._latest_tracks)
 
     def current_tracks(self) -> List[Track]:
         return list(self._latest_tracks)
+
+    def supports_motion_prediction(self) -> bool:
+        return self.bytetrack is not None
 
     def _run_bytetrack(self, detections: List[Track]) -> List[Track]:
         assert self.bytetrack is not None
@@ -198,5 +193,31 @@ class TrackerAdapter:
             tid = int(tracked.tracker_id[i])
             x1, y1, x2, y2 = [int(v) for v in tracked.xyxy[i]]
             score = float(tracked.confidence[i]) if tracked.confidence is not None else 0.0
-            out.append(Track(track_id=tid, bbox=(x1, y1, x2, y2), score=score, feature=None))
+            feature: Optional[np.ndarray] = None
+            if detections:
+                best_iou = 0.0
+                best_feature: Optional[np.ndarray] = None
+                for det in detections:
+                    overlap = iou((x1, y1, x2, y2), tuple(det.bbox))
+                    if overlap > best_iou:
+                        best_iou = overlap
+                        best_feature = det.feature
+                if best_iou >= 0.10 and best_feature is not None:
+                    feature = best_feature
+            if feature is None:
+                feature = self._track_features.get(tid)
+            out.append(Track(track_id=tid, bbox=(x1, y1, x2, y2), score=score, feature=feature))
         return out
+
+    def _refresh_track_feature_cache(self, tracks: List[Track]) -> None:
+        active: Dict[int, np.ndarray] = {}
+        for tr in tracks:
+            tid = int(tr.track_id)
+            if tr.feature is not None:
+                active[tid] = tr.feature
+                continue
+            cached = self._track_features.get(tid)
+            if cached is not None:
+                tr.feature = cached
+                active[tid] = cached
+        self._track_features = active

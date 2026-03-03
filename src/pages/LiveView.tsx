@@ -19,7 +19,10 @@ export function LiveView({ active }: LiveViewProps): JSX.Element {
     const map = new Map<string, TrackPayload>();
     for (const track of roster) {
       const key = track.identity_id !== null ? `id-${track.identity_id}` : `track-${track.track_id}`;
-      if (!map.has(key)) {
+      const current = map.get(key);
+      const currentAge = current?.age_ratio ?? 1;
+      const nextAge = track.age_ratio ?? 1;
+      if (!current || nextAge <= currentAge) {
         map.set(key, track);
       }
     }
@@ -27,8 +30,19 @@ export function LiveView({ active }: LiveViewProps): JSX.Element {
   }, [roster]);
 
   useEffect(() => {
-    if (focusedTrack && !roster.some((track) => track.track_id === focusedTrack.track_id)) {
+    if (!focusedTrack) {
+      return;
+    }
+    const latest = roster.find((track) => track.track_id === focusedTrack.track_id);
+    if (!latest) {
       setFocusedTrack(null);
+      return;
+    }
+    const sameIdentity = latest.identity_id === focusedTrack.identity_id;
+    const sameLabel = latest.label === focusedTrack.label;
+    const sameMuted = Boolean(latest.muted) === Boolean(focusedTrack.muted);
+    if (!sameIdentity || !sameLabel || !sameMuted) {
+      setFocusedTrack(latest);
     }
   }, [focusedTrack, roster]);
 
@@ -42,7 +56,16 @@ export function LiveView({ active }: LiveViewProps): JSX.Element {
       if (action === "snapshot") {
         await snapshotIdentity(id);
       } else {
-        await muteIdentity(id);
+        const nextMuted = !Boolean(focusedTrack.muted);
+        const response = await muteIdentity(id, nextMuted);
+        setRoster((prev) =>
+          prev.map((track) =>
+            track.identity_id === focusedTrack.identity_id
+              ? { ...track, muted: response.muted }
+              : track
+          )
+        );
+        setFocusedTrack((prev) => (prev ? { ...prev, muted: response.muted } : prev));
       }
       setActionState(`${action} done`);
       window.setTimeout(() => setActionState(""), 1200);
@@ -147,7 +170,7 @@ export function LiveView({ active }: LiveViewProps): JSX.Element {
                   className="rounded-lg bg-white/10 px-3 py-1.5 text-xs text-slate-100 hover:bg-white/20"
                   onClick={() => runQuickAction("mute")}
                 >
-                  Mute
+                  {focusedTrack?.muted ? "Unmute" : "Mute"}
                 </button>
               </div>
             </>

@@ -11,6 +11,7 @@ interface IdentityCardProps {
 export function IdentityCard({ identity, layoutId, onOpen }: IdentityCardProps): JSX.Element {
   const thumb = identity.face_samples[0] ?? identity.body_samples[0] ?? "";
   const frequency = identity.stats?.frequency ?? identity.stats?.sightings ?? 0;
+  const displayName = identity.display_name?.trim() || `Identity ${identity.id}`;
 
   return (
     <motion.button
@@ -35,8 +36,12 @@ export function IdentityCard({ identity, layoutId, onOpen }: IdentityCardProps):
       )}
 
       <div className="absolute inset-x-0 bottom-0 bg-gradient-to-t from-slate-950/95 via-slate-950/70 to-transparent p-2.5">
-        <div className="truncate text-xs font-semibold text-slate-100">ID {identity.id}</div>
-        <div className="truncate text-[11px] text-slate-300">Freq: {frequency}</div>
+        <div className="truncate text-xs font-semibold text-slate-100">{displayName}</div>
+        <div className="truncate text-[11px] text-slate-300">
+          ID {identity.id}
+          {identity.is_muted ? " · muted" : ""}
+          {` · Freq: ${frequency}`}
+        </div>
       </div>
     </motion.button>
   );

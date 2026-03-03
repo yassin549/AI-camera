@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Set, Tuple
 
 import cv2
 import numpy as np
@@ -26,6 +28,27 @@ from utils import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+@dataclass
+class _PersistJob:
+    kind: str
+    payload: Dict[str, Any]
+
+
+@dataclass
+class _MediaJob:
+    identity_id: int
+    sample_bgr: np.ndarray
+
+
+def _coerce_size_tuple(raw: object, fallback: Tuple[int, int]) -> Tuple[int, int]:
+    if isinstance(raw, (tuple, list)) and len(raw) >= 2:
+        try:
+            return (max(16, int(raw[0])), max(16, int(raw[1])))
+        except Exception:
+            return fallback
+    return fallback
 
 
 class RecognitionWorker:
@@ -52,7 +75,17 @@ class RecognitionWorker:
         self.metrics = metrics
 
         self.face_detector = FaceROIDetector(min_confidence=float(cfg.get("face_roi_min_confidence", 0.5)))
-        self.face_embedder = FaceEmbedder()
+        face_input_size = _coerce_size_tuple(cfg.get("face_onnx_input_size", (112, 112)), (112, 112))
+        self.face_embedder = FaceEmbedder(
+            backend=str(cfg.get("face_embedder_backend", "auto") or "auto"),
+            onnx_model_path=str(cfg.get("face_onnx_model_path", "") or ""),
+            onnx_input_size=face_input_size,
+            onnx_mean=float(cfg.get("face_onnx_mean", 0.5)),
+            onnx_std=float(cfg.get("face_onnx_std", 0.5)),
+            onnx_output_name=str(cfg.get("face_onnx_output_name", "") or "") or None,
+            onnx_output_index=int(cfg.get("face_onnx_output_index", 0)),
+            target_dim=int(cfg.get("face_embedding_dim", 128)),
+        )
         self.face_detector_available = bool(self.face_detector.available)
 
         self.face_interval = int(cfg.get("face_interval_frames", 4))
@@ -74,18 +107,47 @@ class RecognitionWorker:
         self._last_face_attempt_ts: Dict[int, float] = {}
         self._last_body_attempt_ts: Dict[int, float] = {}
 
+        self.persist_queue_size = max(16, int(cfg.get("recognition_persist_queue_size", 512)))
+        self.persist_batch_size = max(1, int(cfg.get("recognition_persist_batch_size", 16)))
+        self.media_queue_size = max(8, int(cfg.get("recognition_media_queue_size", 256)))
+        self.media_batch_size = max(1, int(cfg.get("recognition_media_batch_size", 8)))
+
+        self._persist_queue: "queue.Queue[Optional[_PersistJob]]" = queue.Queue(maxsize=self.persist_queue_size)
+        self._media_queue: "queue.Queue[Optional[_MediaJob]]" = queue.Queue(maxsize=self.media_queue_size)
+
+        self._pending_lock = threading.Lock()
+        self._pending_identity_tracks: Set[int] = set()
+
         self._thread: Optional[threading.Thread] = None
+        self._persist_thread: Optional[threading.Thread] = None
+        self._media_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
             return
         self._thread = threading.Thread(target=self._run, daemon=True, name="recognition-worker")
+        self._persist_thread = threading.Thread(target=self._persist_loop, daemon=True, name="recognition-persist")
+        self._media_thread = threading.Thread(target=self._media_loop, daemon=True, name="recognition-media")
         self._thread.start()
+        self._persist_thread.start()
+        self._media_thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
+        try:
+            self._persist_queue.put_nowait(None)
+        except Exception:
+            pass
+        try:
+            self._media_queue.put_nowait(None)
+        except Exception:
+            pass
         if self._thread:
             self._thread.join(timeout=2.0)
+        if self._persist_thread:
+            self._persist_thread.join(timeout=2.0)
+        if self._media_thread:
+            self._media_thread.join(timeout=2.0)
         self.face_detector.close()
 
     def _run(self) -> None:
@@ -108,16 +170,34 @@ class RecognitionWorker:
                 self._face_failures.pop(tid, None)
                 self._last_face_attempt_ts.pop(tid, None)
                 self._last_body_attempt_ts.pop(tid, None)
+                self._clear_pending_track(tid)
 
             for st in tracks:
                 # Ignore stale tracks.
                 if frame_id - int(st.last_seen_frame) > 2:
                     continue
 
+                if self._is_track_pending(st.track_id):
+                    self._inc_metric("recognition_pending_identity", 1)
+                    continue
+
+                if st.identity_id is not None and not db.identity_exists(int(st.identity_id)):
+                    self.track_store.assign_identity(
+                        track_id=st.track_id,
+                        identity_id=None,
+                        modality="none",
+                        score=0.0,
+                        frame_id=frame_id,
+                        cache_seconds=0.0,
+                    )
+                    st.identity_id = None
+                    st.cache_until = 0.0
+                    self._inc_metric("stale_identity_cleared", 1)
+
                 # Cache gate for already-linked track IDs.
                 if st.identity_id is not None and now < float(st.cache_until):
                     self._inc_metric("suppressed_by_cache", 1)
-                    LOGGER.info(
+                    LOGGER.debug(
                         "Recognition suppressed by cache | track_id=%s identity_id=%s cache_for=%.2fs",
                         st.track_id,
                         st.identity_id,
@@ -138,7 +218,7 @@ class RecognitionWorker:
                     self._inc_metric("face_attempts", 1)
                     face_emb = self._extract_face_embedding(frame, st.bbox)
                     if face_emb is not None:
-                        self._match_or_create_face(st.track_id, face_emb, frame, st.bbox, frame_id)
+                        self._match_or_create_face_async(st.track_id, face_emb, frame, st.bbox, frame_id)
                         self._face_failures[st.track_id] = 0
                     else:
                         self._face_failures[st.track_id] = int(self._face_failures.get(st.track_id, 0)) + 1
@@ -161,12 +241,182 @@ class RecognitionWorker:
                         self.track_store.mark_body_checked(st.track_id, frame_id)
                         self._last_body_attempt_ts[st.track_id] = now
                         self._inc_metric("recognition_attempts", 1)
-                        self._match_body(st.track_id, st.feature, frame_id)
+                        self._match_body_async(st.track_id, st.feature, frame_id)
                         rec_ms_total += (time.perf_counter() - t0) * 1000.0
 
             self.timing_store.set(frame_id, "recognition_ms", rec_ms_total)
             self.stage_stats.add("recognition_ms", rec_ms_total)
             self.fps_counter.inc(1)
+
+    def _persist_loop(self) -> None:
+        while not self.stop_event.is_set() or not self._persist_queue.empty():
+            try:
+                first = self._persist_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if first is None:
+                if self.stop_event.is_set() and self._persist_queue.empty():
+                    break
+                continue
+
+            batch: list[_PersistJob] = [first]
+            while len(batch) < self.persist_batch_size:
+                try:
+                    nxt = self._persist_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    continue
+                batch.append(nxt)
+
+            for job in batch:
+                self._execute_persist_job(job)
+
+    def _media_loop(self) -> None:
+        while not self.stop_event.is_set() or not self._media_queue.empty():
+            try:
+                first = self._media_queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            if first is None:
+                if self.stop_event.is_set() and self._media_queue.empty():
+                    break
+                continue
+
+            batch: list[_MediaJob] = [first]
+            while len(batch) < self.media_batch_size:
+                try:
+                    nxt = self._media_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if nxt is None:
+                    continue
+                batch.append(nxt)
+
+            for job in batch:
+                self._execute_media_job(job)
+
+    def _execute_persist_job(self, job: _PersistJob) -> None:
+        kind = str(job.kind)
+        payload = job.payload
+        try:
+            if kind == "update_last_seen":
+                db.update_last_seen(int(payload["identity_id"]), str(payload["ts"]))
+                self._inc_metric("db_writes", 1)
+                return
+
+            if kind == "update_body_ema":
+                db.update_body_ema(int(payload["identity_id"]), payload["body_emb"])
+                self._inc_metric("db_writes", 1)
+                return
+
+            if kind == "create_face_identity":
+                track_id = int(payload["track_id"])
+                try:
+                    new_id = db.add_identity(payload["face_emb"], None, None, None, str(payload["ts"]))
+                    self._inc_metric("db_inserts", 1)
+                    self._inc_metric("db_writes", 1)
+                    self.track_store.assign_identity(
+                        track_id=track_id,
+                        identity_id=int(new_id),
+                        modality="face",
+                        score=1.0,
+                        frame_id=int(payload["frame_id"]),
+                        cache_seconds=self.cache_seconds,
+                    )
+                    sample = payload.get("sample")
+                    if isinstance(sample, np.ndarray) and sample.size > 0:
+                        self._enqueue_media(_MediaJob(identity_id=int(new_id), sample_bgr=sample))
+                finally:
+                    self._clear_pending_track(track_id)
+                return
+
+            if kind == "create_body_identity":
+                track_id = int(payload["track_id"])
+                try:
+                    new_id = db.add_identity(None, payload["body_emb"], None, None, str(payload["ts"]))
+                    self._inc_metric("db_inserts", 1)
+                    self._inc_metric("db_writes", 1)
+                    self.track_store.assign_identity(
+                        track_id=track_id,
+                        identity_id=int(new_id),
+                        modality="body",
+                        score=1.0,
+                        frame_id=int(payload["frame_id"]),
+                        cache_seconds=self.cache_seconds,
+                    )
+                finally:
+                    self._clear_pending_track(track_id)
+                return
+
+            LOGGER.debug("Unknown persist job kind=%s", kind)
+        except Exception:
+            if kind in {"create_face_identity", "create_body_identity"}:
+                try:
+                    self._clear_pending_track(int(payload.get("track_id", -1)))
+                except Exception:
+                    pass
+            LOGGER.exception("Persist job failed | kind=%s", kind)
+
+    def _execute_media_job(self, job: _MediaJob) -> None:
+        sample = job.sample_bgr
+        if sample is None or sample.size == 0:
+            return
+
+        ts_str = time.strftime("%Y-%m-%d_%H-%M-%S")
+        ms_part = int((time.time() * 1000.0) % 1000)
+        sample_path = str(Path(self.faces_dir) / f"{int(job.identity_id)}_{ts_str}_{ms_part:03d}.jpg")
+        ok = False
+        try:
+            ok = bool(cv2.imwrite(sample_path, sample))
+        except Exception:
+            ok = False
+        if not ok:
+            LOGGER.debug("Failed to write face sample | identity_id=%s path=%s", job.identity_id, sample_path)
+            return
+
+        try:
+            db.update_face_sample_path(int(job.identity_id), sample_path)
+            self._inc_metric("db_writes", 1)
+            self._inc_metric("media_writes", 1)
+        except Exception:
+            LOGGER.exception("Failed to persist face sample path | identity_id=%s", job.identity_id)
+
+    def _enqueue_persist(self, job: _PersistJob) -> bool:
+        try:
+            self._persist_queue.put_nowait(job)
+            return True
+        except queue.Full:
+            self._inc_metric("persist_queue_drop", 1)
+            LOGGER.debug("Persist queue full; dropping job kind=%s", job.kind)
+            return False
+
+    def _enqueue_media(self, job: _MediaJob) -> bool:
+        try:
+            self._media_queue.put_nowait(job)
+            return True
+        except queue.Full:
+            self._inc_metric("media_queue_drop", 1)
+            LOGGER.debug("Media queue full; dropping sample for identity_id=%s", job.identity_id)
+            return False
+
+    def _mark_track_pending(self, track_id: int) -> bool:
+        tid = int(track_id)
+        with self._pending_lock:
+            if tid in self._pending_identity_tracks:
+                return False
+            self._pending_identity_tracks.add(tid)
+        return True
+
+    def _clear_pending_track(self, track_id: int) -> None:
+        tid = int(track_id)
+        with self._pending_lock:
+            self._pending_identity_tracks.discard(tid)
+
+    def _is_track_pending(self, track_id: int) -> bool:
+        tid = int(track_id)
+        with self._pending_lock:
+            return tid in self._pending_identity_tracks
 
     def _extract_face_embedding(
         self,
@@ -230,7 +480,7 @@ class RecognitionWorker:
             self._inc_metric("embedding_success", 1)
         return emb
 
-    def _match_or_create_face(
+    def _match_or_create_face_async(
         self,
         track_id: int,
         face_emb: np.ndarray,
@@ -242,8 +492,6 @@ class RecognitionWorker:
 
         best_id, best_score = db.find_best_face(face_emb)
         if best_id is not None and best_score >= self.face_threshold:
-            db.update_last_seen(int(best_id), now_ts)
-            self._inc_metric("successful_matches", 1)
             self.track_store.assign_identity(
                 track_id=track_id,
                 identity_id=int(best_id),
@@ -252,6 +500,16 @@ class RecognitionWorker:
                 frame_id=frame_id,
                 cache_seconds=self.cache_seconds,
             )
+            self._inc_metric("successful_matches", 1)
+            self._enqueue_persist(
+                _PersistJob(
+                    kind="update_last_seen",
+                    payload={"identity_id": int(best_id), "ts": now_ts},
+                )
+            )
+            return
+
+        if not self._mark_track_pending(track_id):
             return
 
         x1, y1, x2, y2 = [int(v) for v in person_bbox]
@@ -261,40 +519,27 @@ class RecognitionWorker:
         x2 = max(x1 + 1, min(w, x2))
         y2 = max(y1 + 1, min(h, y2))
         sample = frame_bgr[y1:y2, x1:x2]
+        sample_copy = sample.copy() if sample.size > 0 else np.zeros((0, 0, 3), dtype=np.uint8)
 
-        # Create identity first so we can use the ID in the filename.
-        new_id = db.add_identity(face_emb, None, None, None, now_ts)
-        self._inc_metric("db_inserts", 1)
-        self._inc_metric("db_writes", 1)
-
-        # Save the face sample with identity ID in the filename so that
-        # _discover_face_thumb() can find it via the <id>_*.jpg glob pattern.
-        sample_path: Optional[str] = None
-        if sample.size > 0:
-            ts_str = time.strftime("%Y-%m-%d_%H-%M-%S")
-            sample_path = str(Path(self.faces_dir) / f"{int(new_id)}_{ts_str}.jpg")
-            cv2.imwrite(sample_path, sample)
-            # Update the DB row with the sample path.
-            db.update_face_sample_path(int(new_id), sample_path)
-            self._inc_metric("db_writes", 1)
-
-        self.track_store.assign_identity(
-            track_id=track_id,
-            identity_id=int(new_id),
-            modality="face",
-            score=1.0,
-            frame_id=frame_id,
-            cache_seconds=self.cache_seconds,
+        queued = self._enqueue_persist(
+            _PersistJob(
+                kind="create_face_identity",
+                payload={
+                    "track_id": int(track_id),
+                    "face_emb": face_emb,
+                    "frame_id": int(frame_id),
+                    "sample": sample_copy,
+                    "ts": now_ts,
+                },
+            )
         )
+        if not queued:
+            self._clear_pending_track(track_id)
 
-    def _match_body(self, track_id: int, body_emb: np.ndarray, frame_id: int) -> None:
+    def _match_body_async(self, track_id: int, body_emb: np.ndarray, frame_id: int) -> None:
         now_ts = timestamp_iso()
         best_id, best_score = db.find_best_body(body_emb)
         if best_id is not None and best_score >= self.body_threshold:
-            db.update_last_seen(int(best_id), now_ts)
-            db.update_body_ema(int(best_id), body_emb)
-            self._inc_metric("successful_matches", 1)
-            self._inc_metric("db_writes", 2)
             self.track_store.assign_identity(
                 track_id=track_id,
                 identity_id=int(best_id),
@@ -303,20 +548,37 @@ class RecognitionWorker:
                 frame_id=frame_id,
                 cache_seconds=self.cache_seconds,
             )
+            self._inc_metric("successful_matches", 1)
+            self._enqueue_persist(
+                _PersistJob(
+                    kind="update_last_seen",
+                    payload={"identity_id": int(best_id), "ts": now_ts},
+                )
+            )
+            self._enqueue_persist(
+                _PersistJob(
+                    kind="update_body_ema",
+                    payload={"identity_id": int(best_id), "body_emb": body_emb},
+                )
+            )
             return
 
         if self.persist_body_only:
-            new_id = db.add_identity(None, body_emb, None, None, now_ts)
-            self._inc_metric("db_inserts", 1)
-            self._inc_metric("db_writes", 1)
-            self.track_store.assign_identity(
-                track_id=track_id,
-                identity_id=int(new_id),
-                modality="body",
-                score=1.0,
-                frame_id=frame_id,
-                cache_seconds=self.cache_seconds,
+            if not self._mark_track_pending(track_id):
+                return
+            queued = self._enqueue_persist(
+                _PersistJob(
+                    kind="create_body_identity",
+                    payload={
+                        "track_id": int(track_id),
+                        "body_emb": body_emb,
+                        "frame_id": int(frame_id),
+                        "ts": now_ts,
+                    },
+                )
             )
+            if not queued:
+                self._clear_pending_track(track_id)
 
     def _inc_metric(self, name: str, amount: int = 1) -> None:
         if self.metrics is not None:

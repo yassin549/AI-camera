@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { withApiKeyHeaders } from "../api/client";
+import { withApiKeyHeaders, withApiKeyQuery } from "../api/client";
+import { API } from "../config";
 
 interface AuthenticatedImageProps {
   src: string;
@@ -12,11 +13,26 @@ const objectUrlCache = new Map<string, string>();
 
 function isNgrokFreeUrl(input: string): boolean {
   try {
-    const host = new URL(input).hostname.toLowerCase();
+    const host = new URL(input, window.location.href).hostname.toLowerCase();
     return host.endsWith(".ngrok-free.app") || host.endsWith(".ngrok-free.dev");
   } catch {
     return false;
   }
+}
+
+function normalizeMediaUrl(src: string): string {
+  if (!src) {
+    return src;
+  }
+  if (/^(https?:)?\/\//i.test(src) || src.startsWith("data:") || src.startsWith("blob:")) {
+    return src;
+  }
+  const base = (API.REST_BASE || "").replace(/\/+$/, "");
+  if (!base) {
+    return src;
+  }
+  const path = src.startsWith("/") ? src : `/${src}`;
+  return `${base}${path}`;
 }
 
 export function AuthenticatedImage({
@@ -25,27 +41,31 @@ export function AuthenticatedImage({
   className,
   loading = "lazy"
 }: AuthenticatedImageProps): JSX.Element {
-  const [resolvedSrc, setResolvedSrc] = useState<string>(src);
-  const shouldProxyFetch = useMemo(() => Boolean(src) && isNgrokFreeUrl(src), [src]);
+  const normalizedSrc = useMemo(() => withApiKeyQuery(normalizeMediaUrl(src)), [src]);
+  const [resolvedSrc, setResolvedSrc] = useState<string>(normalizedSrc);
+  const shouldProxyFetch = useMemo(
+    () => Boolean(normalizedSrc) && isNgrokFreeUrl(normalizedSrc),
+    [normalizedSrc]
+  );
 
   useEffect(() => {
     let cancelled = false;
-    if (!src) {
+    if (!normalizedSrc) {
       setResolvedSrc("");
       return;
     }
     if (!shouldProxyFetch) {
-      setResolvedSrc(src);
+      setResolvedSrc(normalizedSrc);
       return;
     }
-    const cached = objectUrlCache.get(src);
+    const cached = objectUrlCache.get(normalizedSrc);
     if (cached) {
       setResolvedSrc(cached);
       return;
     }
 
     const controller = new AbortController();
-    void fetch(src, {
+    void fetch(normalizedSrc, {
       method: "GET",
       headers: withApiKeyHeaders(),
       signal: controller.signal
@@ -54,17 +74,21 @@ export function AuthenticatedImage({
         if (!response.ok) {
           throw new Error(`Image fetch failed (${response.status})`);
         }
+        const contentType = (response.headers.get("content-type") || "").toLowerCase();
+        if (!contentType.startsWith("image/")) {
+          throw new Error(`Unexpected image content-type: ${contentType || "unknown"}`);
+        }
         const blob = await response.blob();
         if (cancelled) {
           return;
         }
         const objectUrl = URL.createObjectURL(blob);
-        objectUrlCache.set(src, objectUrl);
+        objectUrlCache.set(normalizedSrc, objectUrl);
         setResolvedSrc(objectUrl);
       })
       .catch(() => {
         if (!cancelled) {
-          setResolvedSrc(src);
+          setResolvedSrc(normalizedSrc);
         }
       });
 
@@ -72,8 +96,7 @@ export function AuthenticatedImage({
       cancelled = true;
       controller.abort();
     };
-  }, [shouldProxyFetch, src]);
+  }, [normalizedSrc, shouldProxyFetch]);
 
   return <img src={resolvedSrc} alt={alt} loading={loading} className={className} />;
 }
-

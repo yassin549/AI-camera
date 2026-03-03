@@ -1,9 +1,20 @@
 rtsp_url: "rtsp://pyuser:yacine03041973@192.168.1.70:554/cam/realmonitor?channel=1&subtype=0"
-imgsz: [640, 360]
+imgsz: [640, 384]
 target_fps: 30
 detection_interval: 1
 detection_interval_max: 6
 adaptive_detection_interval: true
+detection_duty_cycle_target: 0.60
+detection_duty_cycle_hysteresis: 0.12
+detection_duty_cycle_ema_alpha: 0.25
+detection_interval_cooldown_frames: 6
+detection_min_gap_scale: 0.35
+adaptive_detection_resolution: true
+detection_resolution_profiles:
+  - [640, 384]
+  - [512, 288]
+detection_resolution_cooldown_detections: 12
+detection_resolution_warmup_runs: 1
 face_interval_frames: 4
 body_interval_frames: 10
 face_threshold: 0.60
@@ -15,8 +26,19 @@ http_port: 8080
 
 http_host: "127.0.0.1"
 yolo_onnx_path: "./models/yolov8n_person.onnx"
+yolo_onnx_fast_path: "./models/yolov8n_person_640x384_int8.onnx"
+prefer_fast_person_model: true
+detector_backend: "rtdetr_onnx"
+detector_model_path: "./models/rtdetr-l_person.onnx"
+rtdetr_onnx_path: "./models/rtdetr-l_person.onnx"
+detector_output_format: "auto"
+detector_person_class_id: 0
+detector_max_detections: 300
 yolo_feature_output_name: ""
-person_conf_threshold: 0.50
+onnx_intra_threads: 3
+onnx_inter_threads: 1
+detector_warmup_runs: 2
+person_conf_threshold: 0.35
 person_iou_threshold: 0.50
 tracker_match_threshold: 0.80
 
@@ -25,9 +47,27 @@ persist_body_only: true
 body_fallback_enabled: true
 body_fallback_after_face_failures: 3
 body_fallback_model_path: ""
+body_fallback_input_size: [128, 256]
+body_fallback_target_dim: 256
+body_fallback_mean: 0.5
+body_fallback_std: 0.5
+body_fallback_output_name: ""
+body_fallback_output_index: 0
+face_embedder_backend: "auto"
+face_onnx_model_path: ""
+face_onnx_input_size: [112, 112]
+face_onnx_mean: 0.5
+face_onnx_std: 0.5
+face_onnx_output_name: ""
+face_onnx_output_index: 0
+face_embedding_dim: 128
 face_top_ratio: 0.68
 face_min_pixels: 40
 face_roi_min_confidence: 0.50
+recognition_persist_queue_size: 512
+recognition_persist_batch_size: 16
+recognition_media_queue_size: 256
+recognition_media_batch_size: 8
 
 db_path: "./identities.db"
 faces_dir: "./faces"

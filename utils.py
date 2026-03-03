@@ -229,6 +229,37 @@ class SharedTrackStore:
             st.cache_until = time.time() + max(0.0, float(cache_seconds))
             st.last_embedding_frame = int(frame_id)
 
+    def remap_identity(self, source_identity_id: int, target_identity_id: int) -> int:
+        src = int(source_identity_id)
+        dst = int(target_identity_id)
+        if src == dst:
+            return 0
+        updated = 0
+        with self._lock:
+            for st in self._tracks.values():
+                if st.identity_id != src:
+                    continue
+                st.identity_id = dst
+                updated += 1
+        return updated
+
+    def clear_identity(self, identity_id: int) -> int:
+        ident = int(identity_id)
+        cleared = 0
+        with self._lock:
+            for st in self._tracks.values():
+                if st.identity_id != ident:
+                    continue
+                st.identity_id = None
+                st.modality = "none"
+                st.identity_score = 0.0
+                st.cache_until = 0.0
+                st.last_face_frame = -1_000_000
+                st.last_body_frame = -1_000_000
+                st.last_embedding_frame = -1_000_000
+                cleared += 1
+        return cleared
+
     def set_cache_until(self, track_id: int, cache_until_ts: float) -> None:
         with self._lock:
             st = self._tracks.get(int(track_id))
@@ -284,7 +315,7 @@ class FrameTimingStore:
 
 
 class StageStats:
-    """Rolling statistics per stage with avg and p95 reporting."""
+    """Rolling statistics per stage with avg, p50, and p95 reporting."""
 
     def __init__(self, window: int = 2048) -> None:
         self._lock = threading.Lock()
@@ -296,14 +327,14 @@ class StageStats:
             self._values[stage].append(float(value))
             self._counts[stage] += 1
 
-    def summary(self, stage: str) -> Tuple[int, float, float]:
+    def summary(self, stage: str) -> Tuple[int, float, float, float]:
         with self._lock:
             vals = list(self._values.get(stage, []))
             count = int(self._counts.get(stage, 0))
         if not vals:
-            return count, 0.0, 0.0
+            return count, 0.0, 0.0, 0.0
         arr = np.asarray(vals, dtype=np.float32)
-        return count, float(arr.mean()), float(np.percentile(arr, 95))
+        return count, float(arr.mean()), float(np.percentile(arr, 50)), float(np.percentile(arr, 95))
 
 
 class CounterFPS:

@@ -72,6 +72,7 @@ export function Library({ initialIdentities }: LibraryProps): JSX.Element {
       }
       return (
         identity.id.toLowerCase().includes(normalized) ||
+        (identity.display_name ?? "").toLowerCase().includes(normalized) ||
         identity.first_seen.toLowerCase().includes(normalized) ||
         identity.last_seen.toLowerCase().includes(normalized)
       );

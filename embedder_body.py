@@ -17,11 +17,27 @@ LOGGER = logging.getLogger(__name__)
 class MobileNetBodyFallback:
     """Tiny body descriptor fallback using a MobileNetV2 ONNX model."""
 
-    def __init__(self, model_path: Optional[str], input_size: Tuple[int, int] = (128, 256)) -> None:
+    def __init__(
+        self,
+        model_path: Optional[str],
+        input_size: Tuple[int, int] = (128, 256),
+        target_dim: int = 256,
+        mean: float = 0.5,
+        std: float = 0.5,
+        output_name: Optional[str] = None,
+        output_index: int = 0,
+    ) -> None:
         self.model_path = model_path
         self.input_w = int(input_size[0])
         self.input_h = int(input_size[1])
+        self.target_dim = max(16, int(target_dim))
+        self.mean = float(mean)
+        self.std = max(1e-6, float(std))
+        self.output_name = str(output_name).strip() if output_name else None
+        self.output_index = int(output_index)
         self.session: Optional[ort.InferenceSession] = None
+        self.input_name: Optional[str] = None
+        self.selected_output_name: Optional[str] = None
         self.active = False
 
         if not model_path:
@@ -36,36 +52,57 @@ class MobileNetBodyFallback:
                 sess_options=so,
                 providers=["CPUExecutionProvider"],
             )
+            self.input_name = self.session.get_inputs()[0].name
+            output_names = [o.name for o in self.session.get_outputs()]
+            if self.output_name and self.output_name in output_names:
+                self.selected_output_name = self.output_name
+            elif output_names:
+                idx = max(0, min(len(output_names) - 1, self.output_index))
+                self.selected_output_name = output_names[idx]
             self.active = True
-            LOGGER.info("Body descriptor path: MobileNetV2 fallback (%s)", model_path)
+            LOGGER.info(
+                "Body descriptor path: ONNX crop fallback (%s) input=%sx%s dim=%s output=%s",
+                model_path,
+                self.input_w,
+                self.input_h,
+                self.target_dim,
+                self.selected_output_name or "default",
+            )
         except Exception as exc:
             LOGGER.warning("Could not load MobileNet fallback model: %s", exc)
 
     def embed(self, bgr_crop: np.ndarray) -> np.ndarray:
         if bgr_crop is None or bgr_crop.size == 0:
-            return np.zeros((256,), dtype=np.float32)
+            return np.zeros((self.target_dim,), dtype=np.float32)
 
         if self.session is None:
             # Low-cost fallback descriptor to preserve runtime behavior.
             hsv = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2HSV)
             hist = cv2.calcHist([hsv], [0, 1, 2], None, [8, 8, 4], [0, 180, 0, 256, 0, 256])
             flat = hist.reshape(-1).astype(np.float32)
+            if flat.size >= self.target_dim:
+                flat = flat[: self.target_dim]
+            else:
+                flat = np.pad(flat, (0, self.target_dim - flat.size), mode="constant")
             return l2_normalize(flat)
 
         rgb = cv2.cvtColor(bgr_crop, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(rgb, (self.input_w, self.input_h), interpolation=cv2.INTER_LINEAR)
         tensor = resized.astype(np.float32) / 255.0
-        tensor = (tensor - 0.5) / 0.5
+        tensor = (tensor - self.mean) / self.std
         tensor = np.transpose(tensor, (2, 0, 1))[None, ...]
 
-        input_name = self.session.get_inputs()[0].name
-        output = self.session.run(None, {input_name: tensor})[0]
+        input_name = self.input_name or self.session.get_inputs()[0].name
+        if self.selected_output_name:
+            output = self.session.run([self.selected_output_name], {input_name: tensor})[0]
+        else:
+            output = self.session.run(None, {input_name: tensor})[0]
         flat = np.asarray(output, dtype=np.float32).reshape(-1)
 
-        if flat.size >= 256:
-            flat = flat[:256]
+        if flat.size >= self.target_dim:
+            flat = flat[: self.target_dim]
         else:
-            flat = np.pad(flat, (0, 256 - flat.size), mode="constant")
+            flat = np.pad(flat, (0, self.target_dim - flat.size), mode="constant")
         return l2_normalize(flat)
 
 

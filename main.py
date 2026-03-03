@@ -8,7 +8,7 @@ import logging
 import threading
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import cv2
 import yaml
@@ -16,7 +16,8 @@ import yaml
 import db
 from api_server import ApiRuntimeState, run_api_server
 from capture import CaptureWorker
-from detector_yolo import Detection, YOLOv8ONNXDetector
+from detector_factory import create_person_detector
+from detector_yolo import Detection
 from recognition_worker import RecognitionWorker
 from tracker_adapter import Track, TrackerAdapter
 from utils import (
@@ -47,11 +48,20 @@ def load_config(path: str) -> Dict[str, object]:
         cfg["rtsp_url"] = cfg["RTSP_URL"]
 
     # Runtime defaults.
-    cfg.setdefault("imgsz", [640, 360])
+    cfg.setdefault("imgsz", [640, 384])
     cfg.setdefault("target_fps", 30.0)
     cfg.setdefault("detection_interval", 1)
     cfg.setdefault("detection_interval_max", 6)
     cfg.setdefault("adaptive_detection_interval", True)
+    cfg.setdefault("detection_duty_cycle_target", 0.60)
+    cfg.setdefault("detection_duty_cycle_hysteresis", 0.12)
+    cfg.setdefault("detection_duty_cycle_ema_alpha", 0.25)
+    cfg.setdefault("detection_interval_cooldown_frames", 6)
+    cfg.setdefault("detection_min_gap_scale", 0.35)
+    cfg.setdefault("adaptive_detection_resolution", True)
+    cfg.setdefault("detection_resolution_profiles", [])
+    cfg.setdefault("detection_resolution_cooldown_detections", 12)
+    cfg.setdefault("detection_resolution_warmup_runs", 1)
     cfg.setdefault("face_interval_frames", 4)
     cfg.setdefault("body_interval_frames", 10)
     cfg.setdefault("face_threshold", 0.60)
@@ -69,17 +79,96 @@ def load_config(path: str) -> Dict[str, object]:
     cfg.setdefault("body_fallback_enabled", True)
     cfg.setdefault("body_fallback_after_face_failures", 3)
     cfg.setdefault("body_fallback_model_path", "")
+    cfg.setdefault("body_fallback_input_size", [128, 256])
+    cfg.setdefault("body_fallback_target_dim", 256)
+    cfg.setdefault("body_fallback_mean", 0.5)
+    cfg.setdefault("body_fallback_std", 0.5)
+    cfg.setdefault("body_fallback_output_name", "")
+    cfg.setdefault("body_fallback_output_index", 0)
     cfg.setdefault("face_top_ratio", 0.68)
     cfg.setdefault("face_min_pixels", 40)
     cfg.setdefault("face_roi_min_confidence", 0.50)
+    cfg.setdefault("face_embedder_backend", "auto")
+    cfg.setdefault("face_onnx_model_path", "")
+    cfg.setdefault("face_onnx_input_size", [112, 112])
+    cfg.setdefault("face_onnx_mean", 0.5)
+    cfg.setdefault("face_onnx_std", 0.5)
+    cfg.setdefault("face_onnx_output_name", "")
+    cfg.setdefault("face_onnx_output_index", 0)
+    cfg.setdefault("face_embedding_dim", 128)
+    cfg.setdefault("recognition_persist_queue_size", 512)
+    cfg.setdefault("recognition_persist_batch_size", 16)
+    cfg.setdefault("recognition_media_queue_size", 256)
+    cfg.setdefault("recognition_media_batch_size", 8)
 
     # Model defaults.
     cfg.setdefault("yolo_onnx_path", "./models/yolov8n_person.onnx")
+    cfg.setdefault("yolo_onnx_fast_path", "./models/yolov8n_person_640x384_int8.onnx")
+    cfg.setdefault("prefer_fast_person_model", True)
+    cfg.setdefault("detector_backend", "yolo_onnx")
+    cfg.setdefault("detector_model_path", "")
+    cfg.setdefault("rtdetr_onnx_path", "./models/rtdetr-l_person.onnx")
+    cfg.setdefault("detector_output_format", "auto")
+    cfg.setdefault("detector_person_class_id", 0)
+    cfg.setdefault("detector_max_detections", 300)
     cfg.setdefault("person_conf_threshold", 0.50)
     cfg.setdefault("person_iou_threshold", 0.50)
     cfg.setdefault("tracker_match_threshold", 0.80)
+    cfg.setdefault("onnx_intra_threads", 0)
+    cfg.setdefault("onnx_inter_threads", 1)
+    cfg.setdefault("detector_warmup_runs", 2)
+
+    if bool(cfg.get("prefer_fast_person_model", True)):
+        fast_candidate = str(cfg.get("yolo_onnx_fast_path", "")).strip()
+        current_model = str(cfg.get("yolo_onnx_path", "")).strip()
+        if (
+            fast_candidate
+            and Path(fast_candidate).exists()
+            and (not current_model or current_model == "./models/yolov8n_person.onnx")
+        ):
+            cfg["yolo_onnx_path"] = fast_candidate
 
     return cfg
+
+
+def _coerce_resolution(raw: Any, fallback: Tuple[int, int]) -> Tuple[int, int]:
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        try:
+            width = max(1, int(raw[0]))
+            height = max(1, int(raw[1]))
+            return width, height
+        except Exception:
+            return fallback
+    return fallback
+
+
+def _build_resolution_profiles(cfg: Dict[str, object], base: Tuple[int, int]) -> List[Tuple[int, int]]:
+    raw_profiles = cfg.get("detection_resolution_profiles", [])
+    profiles: List[Tuple[int, int]] = [base]
+
+    if isinstance(raw_profiles, (list, tuple)):
+        for raw in raw_profiles:
+            parsed = _coerce_resolution(raw, base)
+            profiles.append(parsed)
+
+    if len(profiles) <= 1:
+        scaled_w = int(round(base[0] * 0.8))
+        scaled_h = int(round(base[1] * 0.8))
+        downsampled = (
+            max(320, max(1, scaled_w // 32) * 32),
+            max(192, max(1, scaled_h // 32) * 32),
+        )
+        if downsampled != base:
+            profiles.append(downsampled)
+
+    deduped: List[Tuple[int, int]] = []
+    seen = set()
+    for size in profiles:
+        if size in seen:
+            continue
+        seen.add(size)
+        deduped.append(size)
+    return deduped
 
 
 def _render_overlay(frame, tracks: List[object]) -> None:
@@ -112,10 +201,10 @@ def _log_stage_window(
     fps_render: CounterFPS,
     window_sec: float,
 ) -> Dict[str, float]:
-    d_cnt, d_avg, d_p95 = stage_stats.summary("detection_ms")
-    t_cnt, t_avg, t_p95 = stage_stats.summary("tracking_ms")
-    r_cnt, r_avg, r_p95 = stage_stats.summary("recognition_ms")
-    v_cnt, v_avg, v_p95 = stage_stats.summary("render_ms")
+    d_cnt, d_avg, d_p50, d_p95 = stage_stats.summary("detection_ms")
+    t_cnt, t_avg, t_p50, t_p95 = stage_stats.summary("tracking_ms")
+    r_cnt, r_avg, r_p50, r_p95 = stage_stats.summary("recognition_ms")
+    v_cnt, v_avg, v_p50, v_p95 = stage_stats.summary("render_ms")
 
     det_fps = fps_detection.pop() / max(window_sec, 1e-6)
     trk_fps = fps_tracking.pop() / max(window_sec, 1e-6)
@@ -124,18 +213,22 @@ def _log_stage_window(
 
     LOGGER.info(
         "FPS(det/track/rec/render)=%.1f/%.1f/%.1f/%.1f | "
-        "ms avg,p95 det=%.1f,%.1f track=%.1f,%.1f rec=%.1f,%.1f render=%.1f,%.1f | counts d=%d t=%d r=%d v=%d",
+        "ms avg,p50,p95 det=%.1f,%.1f,%.1f track=%.1f,%.1f,%.1f rec=%.1f,%.1f,%.1f render=%.1f,%.1f,%.1f | counts d=%d t=%d r=%d v=%d",
         det_fps,
         trk_fps,
         rec_fps,
         rnd_fps,
         d_avg,
+        d_p50,
         d_p95,
         t_avg,
+        t_p50,
         t_p95,
         r_avg,
+        r_p50,
         r_p95,
         v_avg,
+        v_p50,
         v_p95,
         d_cnt,
         t_cnt,
@@ -147,6 +240,18 @@ def _log_stage_window(
         "trk_fps": float(trk_fps),
         "rec_fps": float(rec_fps),
         "rnd_fps": float(rnd_fps),
+        "det_avg_ms": float(d_avg),
+        "det_p50_ms": float(d_p50),
+        "det_p95_ms": float(d_p95),
+        "trk_avg_ms": float(t_avg),
+        "trk_p50_ms": float(t_p50),
+        "trk_p95_ms": float(t_p95),
+        "rec_avg_ms": float(r_avg),
+        "rec_p50_ms": float(r_p50),
+        "rec_p95_ms": float(r_p95),
+        "rnd_avg_ms": float(v_avg),
+        "rnd_p50_ms": float(v_p50),
+        "rnd_p95_ms": float(v_p95),
     }
 
 
@@ -158,23 +263,52 @@ def run_pipeline(
     benchmark_seconds: int,
     display_window: bool,
 ) -> None:
-    imgsz = tuple(cfg.get("imgsz", [640, 360]))
+    base_imgsz = _coerce_resolution(cfg.get("imgsz", [640, 384]), (640, 384))
+    resolution_profiles = _build_resolution_profiles(cfg, base_imgsz)
+    imgsz = resolution_profiles[0]
     detection_interval_cfg = max(1, int(cfg.get("detection_interval", 1)))
     detection_interval_max = max(
         detection_interval_cfg,
         int(cfg.get("detection_interval_max", max(2, detection_interval_cfg))),
     )
     adaptive_detection_interval = bool(cfg.get("adaptive_detection_interval", True))
+    adaptive_detection_resolution = bool(cfg.get("adaptive_detection_resolution", True))
+    detection_duty_cycle_target = min(0.95, max(0.20, float(cfg.get("detection_duty_cycle_target", 0.60))))
+    detection_duty_cycle_hysteresis = min(
+        0.35,
+        max(0.02, float(cfg.get("detection_duty_cycle_hysteresis", 0.12))),
+    )
+    detection_duty_cycle_ema_alpha = min(
+        1.0,
+        max(0.01, float(cfg.get("detection_duty_cycle_ema_alpha", 0.25))),
+    )
+    detection_interval_cooldown_frames = max(1, int(cfg.get("detection_interval_cooldown_frames", 6)))
+    detection_min_gap_scale = min(2.0, max(0.0, float(cfg.get("detection_min_gap_scale", 0.35))))
+    detection_resolution_cooldown_detections = max(
+        1,
+        int(cfg.get("detection_resolution_cooldown_detections", 12)),
+    )
+    detection_resolution_warmup_runs = max(0, int(cfg.get("detection_resolution_warmup_runs", 1)))
     max_track_age_frames = max(1, int(cfg.get("max_track_age_frames", 24)))
     target_fps = max(1.0, float(cfg.get("target_fps", 30.0)))
-    frame_budget_ms = 1000.0 / target_fps
+    detector_warmup_runs = max(0, int(cfg.get("detector_warmup_runs", 2)))
 
     LOGGER.info(
-        "Runtime config | detection_interval=%s adaptive_detection=%s detection_interval_max=%s "
-        "max_track_age_frames=%s face_attempt_interval=%s processing_resolution=%sx%s target_fps=%.1f",
+        "Runtime config | detection_interval=%s adaptive_detection=%s adaptive_resolution=%s detection_interval_max=%s "
+        "duty_target=%.2f duty_hysteresis=%.2f duty_ema_alpha=%.2f cooldown_frames=%s min_gap_scale=%.2f "
+        "resolution_profiles=%s resolution_cooldown_detections=%s max_track_age_frames=%s "
+        "face_attempt_interval=%s processing_resolution=%sx%s target_fps=%.1f",
         detection_interval_cfg,
         adaptive_detection_interval,
+        adaptive_detection_resolution,
         detection_interval_max,
+        detection_duty_cycle_target,
+        detection_duty_cycle_hysteresis,
+        detection_duty_cycle_ema_alpha,
+        detection_interval_cooldown_frames,
+        detection_min_gap_scale,
+        ",".join([f"{w}x{h}" for w, h in resolution_profiles]),
+        detection_resolution_cooldown_detections,
         max_track_age_frames,
         int(cfg.get("face_interval_frames", 4)),
         int(imgsz[0]),
@@ -199,15 +333,20 @@ def run_pipeline(
 
     stop_event = threading.Event()
 
-    detector = YOLOv8ONNXDetector(
-        model_path=str(cfg["yolo_onnx_path"]),
-        imgsz=imgsz,
-        conf_threshold=float(cfg.get("person_conf_threshold", 0.50)),
-        iou_threshold=float(cfg.get("person_iou_threshold", 0.50)),
-        feature_output_name=cfg.get("yolo_feature_output_name"),
-        disable_body_embedding=bool(cfg.get("disable_body_embedding", True)),
-        body_fallback_model_path=str(cfg.get("body_fallback_model_path", "")) or None,
-    )
+    detector = create_person_detector(cfg, imgsz)
+    detector_backend = str(getattr(detector, "detector_backend", str(cfg.get("detector_backend", "yolo_onnx"))))
+    detector_model_path = str(getattr(detector, "model_path", str(cfg.get("yolo_onnx_path", ""))))
+    LOGGER.info("Detector backend: %s | model path: %s", detector_backend, detector_model_path)
+    if detector_warmup_runs > 0:
+        warmup_t0 = time.perf_counter()
+        detector.warmup(detector_warmup_runs, capture_sizes=resolution_profiles)
+        warmup_ms = (time.perf_counter() - warmup_t0) * 1000.0
+        LOGGER.info(
+            "Detector warmup complete | runs_per_profile=%s profiles=%s elapsed_ms=%.1f",
+            detector_warmup_runs,
+            len(resolution_profiles),
+            warmup_ms,
+        )
 
     tracker = TrackerAdapter(
         track_thresh=float(cfg.get("person_conf_threshold", 0.50)),
@@ -223,13 +362,32 @@ def run_pipeline(
     )
 
     detection_interval = detection_interval_cfg
+    detection_interval_cooldown = 0
+    active_resolution_idx = 0
+    resolution_cooldown_detections = 0
     max_tracks = int(cfg.get("max_tracks", 20))
     metrics.set_gauge("detection_interval_current", float(detection_interval))
+    metrics.set_gauge("detection_duty_target", float(detection_duty_cycle_target))
+    metrics.set_gauge("processing_resolution_index", float(active_resolution_idx))
+    metrics.set_gauge("processing_width", float(imgsz[0]))
+    metrics.set_gauge("processing_height", float(imgsz[1]))
 
     def detection_loop() -> None:
-        nonlocal detection_interval
+        nonlocal detection_interval, detection_interval_cooldown, active_resolution_idx, resolution_cooldown_detections
         last_frame_id = -1
-        next_detection_due_at = 0.0
+        next_detection_frame = 0
+        last_frame_mono: Optional[float] = None
+        frame_period_ema_sec = 1.0 / max(1.0, target_fps)
+        last_detection_start_mono: Optional[float] = None
+        duty_cycle_ema = float(detection_duty_cycle_target)
+        duty_hi = min(0.99, detection_duty_cycle_target + detection_duty_cycle_hysteresis)
+        duty_lo = max(0.01, detection_duty_cycle_target - detection_duty_cycle_hysteresis)
+        supports_motion_prediction = bool(tracker.supports_motion_prediction())
+        if not supports_motion_prediction:
+            LOGGER.warning(
+                "Tracker motion prediction unavailable; forcing per-frame detections for responsive overlay updates."
+            )
+
         while not stop_event.is_set():
             packet = frame_store.wait_for_new(last_frame_id, timeout=0.1)
             if packet is None:
@@ -241,36 +399,123 @@ def run_pipeline(
 
             tracks: List[Track]
             now_mono = time.monotonic()
-            if now_mono >= next_detection_due_at:
+            if last_frame_mono is not None:
+                frame_delta = now_mono - last_frame_mono
+                if 0.0 < frame_delta <= 1.0:
+                    frame_period_ema_sec = frame_period_ema_sec * 0.90 + frame_delta * 0.10
+            last_frame_mono = now_mono
+
+            effective_detection_interval = max(1, int(detection_interval))
+            if not supports_motion_prediction:
+                effective_detection_interval = 1
+
+            if frame_id >= next_detection_frame:
+                detection_start_mono = time.monotonic()
                 t0 = time.perf_counter()
                 dets = detector.detect(frame)
                 det_ms = (time.perf_counter() - t0) * 1000.0
+                det_elapsed_sec = det_ms / 1000.0
+                if last_detection_start_mono is None:
+                    detection_cycle_sec = max(det_elapsed_sec, frame_period_ema_sec * max(1, effective_detection_interval))
+                else:
+                    detection_cycle_sec = max(det_elapsed_sec, detection_start_mono - last_detection_start_mono)
+                last_detection_start_mono = detection_start_mono
+
+                duty_cycle = min(1.0, det_elapsed_sec / max(1e-6, detection_cycle_sec))
+                duty_cycle_ema = (
+                    (1.0 - detection_duty_cycle_ema_alpha) * duty_cycle_ema
+                    + detection_duty_cycle_ema_alpha * duty_cycle
+                )
+
                 timing_store.set(frame_id, "detection_ms", det_ms)
                 stage_stats.add("detection_ms", det_ms)
                 fps_detection.inc(1)
                 metrics.inc("detector_frames", 1)
+                metrics.set_gauge("detection_duty_cycle", float(duty_cycle))
+                metrics.set_gauge("detection_duty_cycle_ema", float(duty_cycle_ema))
+                metrics.set_gauge("detection_cycle_ms", float(detection_cycle_sec * 1000.0))
+                metrics.set_gauge("frame_period_ms", float(frame_period_ema_sec * 1000.0))
 
                 tr_in = [Track(track_id=-1, bbox=d.bbox, score=d.score, feature=d.feature) for d in dets]
                 t1 = time.perf_counter()
                 tracks = tracker.update(tr_in)
                 tr_ms = (time.perf_counter() - t1) * 1000.0
 
-                if adaptive_detection_interval:
+                if adaptive_detection_interval and supports_motion_prediction:
+                    if detection_interval_cooldown > 0:
+                        detection_interval_cooldown -= 1
                     prev_interval = detection_interval
-                    if det_ms > (frame_budget_ms * 1.15) and detection_interval < detection_interval_max:
-                        detection_interval += 1
-                    elif det_ms < (frame_budget_ms * 0.65) and detection_interval > 1:
-                        detection_interval -= 1
+                    duty_metric = duty_cycle_ema
+
+                    if detection_interval_cooldown <= 0:
+                        if duty_metric > duty_hi and detection_interval < detection_interval_max:
+                            detection_interval += 1
+                            detection_interval_cooldown = detection_interval_cooldown_frames
+                        elif duty_metric < duty_lo and detection_interval > 1:
+                            detection_interval -= 1
+                            detection_interval_cooldown = detection_interval_cooldown_frames
                     if detection_interval != prev_interval:
                         LOGGER.info(
-                            "Adaptive detection interval adjusted %s -> %s (det_ms=%.2f budget_ms=%.2f)",
+                            "Adaptive detection interval adjusted %s -> %s (det_ms=%.2f duty_ema=%.3f target=%.2f cooldown=%s)",
                             prev_interval,
                             detection_interval,
                             det_ms,
-                            frame_budget_ms,
+                            duty_metric,
+                            detection_duty_cycle_target,
+                            detection_interval_cooldown,
                         )
-                next_detection_due_at = time.monotonic() + (max(1, detection_interval) / target_fps)
-                metrics.set_gauge("detection_interval_current", float(detection_interval))
+
+                if adaptive_detection_resolution and len(resolution_profiles) > 1:
+                    if resolution_cooldown_detections > 0:
+                        resolution_cooldown_detections -= 1
+                    if resolution_cooldown_detections <= 0:
+                        next_resolution_idx = active_resolution_idx
+                        if duty_cycle_ema > duty_hi and active_resolution_idx < (len(resolution_profiles) - 1):
+                            next_resolution_idx = active_resolution_idx + 1
+                        elif (
+                            duty_cycle_ema < duty_lo
+                            and active_resolution_idx > 0
+                            and detection_interval <= detection_interval_cfg
+                        ):
+                            next_resolution_idx = active_resolution_idx - 1
+
+                        if next_resolution_idx != active_resolution_idx:
+                            prev_resolution = resolution_profiles[active_resolution_idx]
+                            next_resolution = resolution_profiles[next_resolution_idx]
+                            active_resolution_idx = next_resolution_idx
+                            capture.set_imgsz(next_resolution)
+                            detector.set_capture_size(next_resolution)
+                            if detection_resolution_warmup_runs > 0:
+                                try:
+                                    detector.warmup(
+                                        detection_resolution_warmup_runs,
+                                        capture_sizes=[next_resolution],
+                                    )
+                                except Exception:
+                                    LOGGER.debug("Resolution-switch warmup failed", exc_info=True)
+                            resolution_cooldown_detections = detection_resolution_cooldown_detections
+                            metrics.set_gauge("processing_resolution_index", float(active_resolution_idx))
+                            metrics.set_gauge("processing_width", float(next_resolution[0]))
+                            metrics.set_gauge("processing_height", float(next_resolution[1]))
+                            api_state.set_capability(
+                                "processing_resolution",
+                                {"width": int(next_resolution[0]), "height": int(next_resolution[1])},
+                            )
+                            LOGGER.info(
+                                "Adaptive processing resolution adjusted %sx%s -> %sx%s (duty_ema=%.3f target=%.2f)",
+                                int(prev_resolution[0]),
+                                int(prev_resolution[1]),
+                                int(next_resolution[0]),
+                                int(next_resolution[1]),
+                                duty_cycle_ema,
+                                detection_duty_cycle_target,
+                            )
+
+                interval_frames = max(1, int(detection_interval if supports_motion_prediction else 1))
+                next_detection_frame = frame_id + interval_frames
+                next_gap_sec = max(0.0, float(next_detection_frame - frame_id) * frame_period_ema_sec)
+                metrics.set_gauge("detection_interval_current", float(interval_frames))
+                metrics.set_gauge("detection_next_gap_ms", float(next_gap_sec * 1000.0))
             else:
                 timing_store.set(frame_id, "detection_ms", 0.0)
                 t1 = time.perf_counter()
@@ -307,6 +552,7 @@ def run_pipeline(
         db_path=str(cfg.get("db_path", "./identities.db")),
         media_root=str(cfg.get("media_root", ".")),
         metrics=metrics,
+        track_store=track_store,
     )
     recognition = RecognitionWorker(
         frame_store=frame_store,
@@ -321,8 +567,24 @@ def run_pipeline(
     if not recognition.face_detector_available:
         LOGGER.critical("Face detector unavailable at startup: mediapipe backend is missing")
     api_state.set_capability("face_detector_available", bool(recognition.face_detector_available))
+    api_state.set_capability("detector_backend", detector_backend)
+    api_state.set_capability("detector_model_path", detector_model_path)
+    api_state.set_capability("face_embedder_backend", str(cfg.get("face_embedder_backend", "auto")))
+    api_state.set_capability("face_onnx_model_path", str(cfg.get("face_onnx_model_path", "")))
+    api_state.set_capability("body_fallback_model_path", str(cfg.get("body_fallback_model_path", "")))
+    api_state.set_capability(
+        "detector_model_input",
+        {"width": int(detector.model_input_size[0]), "height": int(detector.model_input_size[1])},
+    )
     api_state.set_capability("adaptive_detection_interval", adaptive_detection_interval)
+    api_state.set_capability("adaptive_detection_resolution", adaptive_detection_resolution)
     api_state.set_capability("processing_resolution", {"width": int(imgsz[0]), "height": int(imgsz[1])})
+    api_state.set_capability(
+        "processing_resolution_profiles",
+        [{"width": int(width), "height": int(height)} for width, height in resolution_profiles],
+    )
+    api_state.set_capability("detection_duty_cycle_target", detection_duty_cycle_target)
+    api_state.set_capability("detection_duty_cycle_ema_alpha", detection_duty_cycle_ema_alpha)
 
     capture.start()
     detection_thread = threading.Thread(target=detection_loop, daemon=True, name="det-track-worker")
@@ -385,6 +647,22 @@ def run_pipeline(
                         fps_render,
                         window_sec=10.0,
                     )
+                    metrics.set_gauge("fps_detector", stage["det_fps"])
+                    metrics.set_gauge("fps_tracker", stage["trk_fps"])
+                    metrics.set_gauge("fps_recognition", stage["rec_fps"])
+                    metrics.set_gauge("fps_render", stage["rnd_fps"])
+                    metrics.set_gauge("ms_avg_detection", stage["det_avg_ms"])
+                    metrics.set_gauge("ms_p50_detection", stage["det_p50_ms"])
+                    metrics.set_gauge("ms_p95_detection", stage["det_p95_ms"])
+                    metrics.set_gauge("ms_avg_tracking", stage["trk_avg_ms"])
+                    metrics.set_gauge("ms_p50_tracking", stage["trk_p50_ms"])
+                    metrics.set_gauge("ms_p95_tracking", stage["trk_p95_ms"])
+                    metrics.set_gauge("ms_avg_recognition", stage["rec_avg_ms"])
+                    metrics.set_gauge("ms_p50_recognition", stage["rec_p50_ms"])
+                    metrics.set_gauge("ms_p95_recognition", stage["rec_p95_ms"])
+                    metrics.set_gauge("ms_avg_render", stage["rnd_avg_ms"])
+                    metrics.set_gauge("ms_p50_render", stage["rnd_p50_ms"])
+                    metrics.set_gauge("ms_p95_render", stage["rnd_p95_ms"])
                     curr = metrics.counters()
                     window_delta = {k: int(curr.get(k, 0) - metric_prev.get(k, 0)) for k in watched_metrics}
                     metric_prev = curr
@@ -455,6 +733,22 @@ def run_pipeline(
                     fps_render,
                     window_sec=10.0,
                 )
+                metrics.set_gauge("fps_detector", stage["det_fps"])
+                metrics.set_gauge("fps_tracker", stage["trk_fps"])
+                metrics.set_gauge("fps_recognition", stage["rec_fps"])
+                metrics.set_gauge("fps_render", stage["rnd_fps"])
+                metrics.set_gauge("ms_avg_detection", stage["det_avg_ms"])
+                metrics.set_gauge("ms_p50_detection", stage["det_p50_ms"])
+                metrics.set_gauge("ms_p95_detection", stage["det_p95_ms"])
+                metrics.set_gauge("ms_avg_tracking", stage["trk_avg_ms"])
+                metrics.set_gauge("ms_p50_tracking", stage["trk_p50_ms"])
+                metrics.set_gauge("ms_p95_tracking", stage["trk_p95_ms"])
+                metrics.set_gauge("ms_avg_recognition", stage["rec_avg_ms"])
+                metrics.set_gauge("ms_p50_recognition", stage["rec_p50_ms"])
+                metrics.set_gauge("ms_p95_recognition", stage["rec_p95_ms"])
+                metrics.set_gauge("ms_avg_render", stage["rnd_avg_ms"])
+                metrics.set_gauge("ms_p50_render", stage["rnd_p50_ms"])
+                metrics.set_gauge("ms_p95_render", stage["rnd_p95_ms"])
                 curr = metrics.counters()
                 window_delta = {k: int(curr.get(k, 0) - metric_prev.get(k, 0)) for k in watched_metrics}
                 metric_prev = curr
@@ -486,15 +780,16 @@ def run_pipeline(
         recognition.stop()
         capture.stop()
         detection_thread.join(timeout=2.0)
+        api_state.close()
         if debug_file is not None:
             debug_file.close()
         cv2.destroyAllWindows()
 
     elapsed = max(1e-6, time.time() - started_at)
-    det_count, det_avg, det_p95 = stage_stats.summary("detection_ms")
-    trk_count, trk_avg, trk_p95 = stage_stats.summary("tracking_ms")
-    rec_count, rec_avg, rec_p95 = stage_stats.summary("recognition_ms")
-    rnd_count, rnd_avg, rnd_p95 = stage_stats.summary("render_ms")
+    det_count, det_avg, det_p50, det_p95 = stage_stats.summary("detection_ms")
+    trk_count, trk_avg, trk_p50, trk_p95 = stage_stats.summary("tracking_ms")
+    rec_count, rec_avg, rec_p50, rec_p95 = stage_stats.summary("recognition_ms")
+    rnd_count, rnd_avg, rnd_p50, rnd_p95 = stage_stats.summary("render_ms")
 
     if benchmark:
         LOGGER.info(
@@ -506,14 +801,18 @@ def run_pipeline(
             rnd_count / elapsed,
         )
         LOGGER.info(
-            "Stage ms avg,p95 | det=%.2f,%.2f track=%.2f,%.2f rec=%.2f,%.2f render=%.2f,%.2f",
+            "Stage ms avg,p50,p95 | det=%.2f,%.2f,%.2f track=%.2f,%.2f,%.2f rec=%.2f,%.2f,%.2f render=%.2f,%.2f,%.2f",
             det_avg,
+            det_p50,
             det_p95,
             trk_avg,
+            trk_p50,
             trk_p95,
             rec_avg,
+            rec_p50,
             rec_p95,
             rnd_avg,
+            rnd_p50,
             rnd_p95,
         )
 

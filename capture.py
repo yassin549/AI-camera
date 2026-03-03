@@ -26,13 +26,26 @@ class CaptureWorker:
         stop_event: threading.Event,
     ) -> None:
         self.source = str(source)
-        self.imgsz = (int(imgsz[0]), int(imgsz[1]))
+        self._imgsz_lock = threading.Lock()
+        self._imgsz = (max(1, int(imgsz[0])), max(1, int(imgsz[1])))
         self.frame_store = frame_store
         self.stop_event = stop_event
         self.capture_buffer = max(1, int(os.getenv("AICAM_CAPTURE_BUFFER", "1")))
         self._thread: Optional[threading.Thread] = None
         self._cap: Optional[cv2.VideoCapture] = None
         self._frame_id = 0
+
+    def set_imgsz(self, imgsz: Tuple[int, int]) -> None:
+        next_size = (max(1, int(imgsz[0])), max(1, int(imgsz[1])))
+        with self._imgsz_lock:
+            if self._imgsz == next_size:
+                return
+            self._imgsz = next_size
+        LOGGER.info("Capture resize target updated: %sx%s", next_size[0], next_size[1])
+
+    def get_imgsz(self) -> Tuple[int, int]:
+        with self._imgsz_lock:
+            return self._imgsz
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -56,6 +69,11 @@ class CaptureWorker:
         src = self.source
         if src.lower().startswith("rtsp://"):
             src = ensure_rtsp_tcp(src)
+            # Lower-latency FFmpeg options for RTSP ingest via OpenCV.
+            if not os.getenv("OPENCV_FFMPEG_CAPTURE_OPTIONS"):
+                os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+                    "rtsp_transport;tcp|fflags;nobuffer|flags;low_delay|max_delay;500000"
+                )
 
         self._cap = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
         if not self._cap.isOpened():
@@ -91,6 +109,11 @@ class CaptureWorker:
 
             retry_idx = 0
             # Single resize point for the full pipeline.
-            resized = cv2.resize(frame, self.imgsz, interpolation=cv2.INTER_LINEAR)
+            target_w, target_h = self.get_imgsz()
+            frame_h, frame_w = frame.shape[:2]
+            if frame_w == target_w and frame_h == target_h:
+                resized = frame
+            else:
+                resized = cv2.resize(frame, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
             self.frame_store.publish(frame_id=self._frame_id, frame=resized, ts=time.time())
             self._frame_id += 1

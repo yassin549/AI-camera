@@ -7,8 +7,10 @@ export interface IdentityStats {
 
 export interface IdentitySummary {
   id: string;
+  display_name?: string;
   first_seen: string;
   last_seen: string;
+  is_muted?: boolean;
   face_samples: string[];
   body_samples: string[];
   stats?: IdentityStats;
@@ -25,22 +27,13 @@ export interface IdentityDetailData extends IdentitySummary {
   samples?: string[];
 }
 
-export interface WebRtcOfferPayload {
-  sdp: string;
-  type: "offer";
-}
-
-export interface WebRtcAnswerPayload {
-  sdp: string;
-  type: "answer";
-}
-
 export interface TrackPayload {
   track_id: number;
   bbox: [number, number, number, number];
   identity_id: number | null;
   label: string;
   modality: "face" | "body" | "none" | string;
+  muted?: boolean;
   age_ratio?: number;
   age_frames?: number;
   thumb?: string;
@@ -49,6 +42,9 @@ export interface TrackPayload {
 export interface MetadataPayload {
   frame_id: number;
   timestamp: string;
+  capture_ts?: string | null;
+  capture_ts_unix?: number | null;
+  metadata_lag_ms?: number | null;
   source_width: number;
   source_height: number;
   tracks: TrackPayload[];
@@ -206,11 +202,21 @@ function coerceStringArray(input: unknown): string[] {
 function normalizeIdentity(raw: unknown): IdentitySummary {
   const source = (raw ?? {}) as Record<string, unknown>;
   const id = asString(source.id ?? source.identity_id ?? source.identityId) ?? "unknown";
+  const displayName = asString(source.display_name ?? source.displayName ?? source.name) ?? undefined;
   const firstSeen =
     asString(source.first_seen ?? source.created_ts ?? source.createdAt ?? source.firstSeen) ??
     new Date(0).toISOString();
   const lastSeen =
     asString(source.last_seen ?? source.last_seen_ts ?? source.lastSeen ?? source.updated_at) ?? firstSeen;
+  const mutedRaw = source.is_muted ?? source.muted;
+  const isMuted =
+    typeof mutedRaw === "boolean"
+      ? mutedRaw
+      : typeof mutedRaw === "number"
+        ? mutedRaw !== 0
+        : typeof mutedRaw === "string"
+          ? ["1", "true", "yes"].includes(mutedRaw.trim().toLowerCase())
+          : undefined;
 
   const faceSamples = [
     ...coerceStringArray(source.face_samples),
@@ -244,8 +250,10 @@ function normalizeIdentity(raw: unknown): IdentitySummary {
 
   return {
     id,
+    ...(displayName ? { display_name: displayName } : {}),
     first_seen: firstSeen,
     last_seen: lastSeen,
+    ...(isMuted !== undefined ? { is_muted: isMuted } : {}),
     face_samples: [...new Set(faceSamples)],
     body_samples: [...new Set(bodySamples)],
     stats
@@ -358,38 +366,6 @@ export async function getIdentityById(id: string): Promise<IdentityDetailData> {
   }
 }
 
-export async function postWebRtcOffer(
-  offer: WebRtcOfferPayload,
-  path = API.WEBRTC_OFFER
-): Promise<WebRtcAnswerPayload> {
-  const headers = withApiKeyHeaders();
-  headers.set("Content-Type", "application/json");
-  const response = await fetch(joinUrl(API.REST_BASE, path), {
-    method: "POST",
-    headers,
-    body: JSON.stringify(offer)
-  });
-  if (!response.ok) {
-    let details = "";
-    try {
-      const contentType = response.headers.get("content-type") ?? "";
-      if (contentType.includes("application/json")) {
-        const payload = (await response.json()) as { detail?: string };
-        details = payload.detail ? String(payload.detail) : "";
-      } else {
-        details = await response.text();
-      }
-    } catch {
-      details = "";
-    }
-    const message = details
-      ? `WebRTC offer failed (${response.status}): ${details}`
-      : `WebRTC offer failed (${response.status})`;
-    throw new HttpError(response.status, message);
-  }
-  return (await response.json()) as WebRtcAnswerPayload;
-}
-
 export async function renameIdentity(id: string, name: string): Promise<{ ok: true }> {
   return request<{ ok: true }>(`/api/identities/${encodeURIComponent(id)}/rename`, {
     method: "POST",
@@ -416,17 +392,17 @@ export async function deleteIdentity(id: string): Promise<{ ok: true }> {
   });
 }
 
-export async function snapshotIdentity(id: string): Promise<{ ok: true }> {
-  return request<{ ok: true }>(`/api/identities/${encodeURIComponent(id)}/snapshot`, {
+export async function snapshotIdentity(id: string): Promise<{ ok: true; sample?: string }> {
+  return request<{ ok: true; sample?: string }>(`/api/identities/${encodeURIComponent(id)}/snapshot`, {
     method: "POST",
     body: JSON.stringify({})
   });
 }
 
-export async function muteIdentity(id: string): Promise<{ ok: true }> {
-  return request<{ ok: true }>(`/api/identities/${encodeURIComponent(id)}/mute`, {
+export async function muteIdentity(id: string, muted?: boolean): Promise<{ ok: true; muted: boolean }> {
+  return request<{ ok: true; muted: boolean }>(`/api/identities/${encodeURIComponent(id)}/mute`, {
     method: "POST",
-    body: JSON.stringify({})
+    body: JSON.stringify(muted === undefined ? {} : { muted })
   });
 }
 

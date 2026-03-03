@@ -9,7 +9,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Callable, Dict, List, Optional, Set, Tuple
 
 import numpy as np
 
@@ -24,6 +24,7 @@ class _WriteJob:
     params: tuple
     wait: bool
     done: threading.Event
+    on_commit_event: Optional[Tuple[str, int]] = None
     result: Optional[int] = None
     error: Optional[Exception] = None
 
@@ -48,6 +49,8 @@ class IdentityStore:
         self.body_ids: List[int] = []
         self.body_matrix = np.zeros((0, 256), dtype=np.float32)
         self._row_cache: Dict[int, Dict[str, object]] = {}
+        self._listeners_lock = threading.Lock()
+        self._change_listeners: List[Callable[[str, int], None]] = []
 
         self._init_schema()
         self.load_all_embeddings()
@@ -84,6 +87,7 @@ class IdentityStore:
             "created_ts",
             "last_seen_ts",
             "is_body_only",
+            "is_muted",
         }
         if required.issubset(cols):
             return
@@ -102,6 +106,7 @@ class IdentityStore:
             "created_ts": "ALTER TABLE identities ADD COLUMN created_ts TEXT",
             "last_seen_ts": "ALTER TABLE identities ADD COLUMN last_seen_ts TEXT",
             "is_body_only": "ALTER TABLE identities ADD COLUMN is_body_only INTEGER NOT NULL DEFAULT 0",
+            "is_muted": "ALTER TABLE identities ADD COLUMN is_muted INTEGER NOT NULL DEFAULT 0",
         }
         with self.conn:
             for col, stmt in alter_map.items():
@@ -136,6 +141,7 @@ class IdentityStore:
                 "WHEN face_emb IS NULL THEN 1 ELSE 0 END "
                 "WHERE is_body_only IS NULL"
             )
+            self.conn.execute("UPDATE identities SET is_muted=COALESCE(is_muted, 0)")
 
     @staticmethod
     def _schema_sql(table_name: str) -> str:
@@ -148,7 +154,8 @@ class IdentityStore:
                 body_sample_path TEXT,
                 created_ts TEXT NOT NULL,
                 last_seen_ts TEXT NOT NULL,
-                is_body_only INTEGER NOT NULL DEFAULT 0
+                is_body_only INTEGER NOT NULL DEFAULT 0,
+                is_muted INTEGER NOT NULL DEFAULT 0
             )
         """
 
@@ -233,24 +240,62 @@ class IdentityStore:
             job = self._write_q.get()
             if job is None:
                 return
+            batch: List[_WriteJob] = [job]
+            stop_after_batch = False
+            while len(batch) < 64:
+                try:
+                    next_job = self._write_q.get_nowait()
+                except queue.Empty:
+                    break
+                if next_job is None:
+                    stop_after_batch = True
+                    break
+                batch.append(next_job)
+            post_commit_events: List[Tuple[str, int]] = []
             try:
                 if self.ephemeral:
-                    if job.wait:
-                        job.result = -1
+                    for queued in batch:
+                        if queued.wait:
+                            queued.result = -1
                     continue
                 with self.conn:
-                    cur = self.conn.execute(job.sql, job.params)
-                    if job.wait:
-                        job.result = int(cur.lastrowid)
+                    for queued in batch:
+                        try:
+                            cur = self.conn.execute(queued.sql, queued.params)
+                            if queued.wait:
+                                queued.result = int(cur.lastrowid)
+                            if queued.on_commit_event is not None:
+                                post_commit_events.append(queued.on_commit_event)
+                        except Exception as exc:
+                            queued.error = exc
             except Exception as exc:  # pragma: no cover - defensive path
-                job.error = exc
+                for queued in batch:
+                    if queued.error is None:
+                        queued.error = exc
             finally:
-                if job.wait:
-                    job.done.set()
+                for queued in batch:
+                    if queued.wait:
+                        queued.done.set()
+            for event_name, ident_id in post_commit_events:
+                self._emit_change(event_name, ident_id)
+            if stop_after_batch:
+                return
 
-    def _enqueue(self, sql: str, params: tuple, wait: bool = False) -> int:
+    def _enqueue(
+        self,
+        sql: str,
+        params: tuple,
+        wait: bool = False,
+        on_commit_event: Optional[Tuple[str, int]] = None,
+    ) -> int:
         done = threading.Event()
-        job = _WriteJob(sql=sql, params=params, wait=wait, done=done)
+        job = _WriteJob(
+            sql=sql,
+            params=params,
+            wait=wait,
+            done=done,
+            on_commit_event=on_commit_event,
+        )
         self._write_q.put(job)
         if not wait:
             return -1
@@ -264,7 +309,7 @@ class IdentityStore:
             cur = self.conn.execute(
                 """
                 SELECT id, face_emb, body_emb, face_sample_path, body_sample_path,
-                       created_ts, last_seen_ts, is_body_only
+                       created_ts, last_seen_ts, is_body_only, is_muted
                 FROM identities
                 ORDER BY id ASC
                 """
@@ -287,6 +332,7 @@ class IdentityStore:
                     created_ts,
                     last_seen_ts,
                     is_body_only,
+                    is_muted,
                 ) = row
 
                 self._row_cache[int(ident_id)] = {
@@ -296,6 +342,7 @@ class IdentityStore:
                     "created_ts": created_ts,
                     "last_seen_ts": last_seen_ts,
                     "is_body_only": bool(is_body_only),
+                    "is_muted": bool(is_muted),
                 }
 
                 if face_blob is not None:
@@ -346,6 +393,7 @@ class IdentityStore:
                     "created_ts": ts,
                     "last_seen_ts": ts,
                     "is_body_only": face_emb is None,
+                    "is_muted": False,
                 }
                 if norm_face is not None:
                     self.face_ids.append(next_id)
@@ -361,8 +409,8 @@ class IdentityStore:
             """
             INSERT INTO identities (
                 face_emb, body_emb, face_sample_path, body_sample_path,
-                created_ts, last_seen_ts, is_body_only
-            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                created_ts, last_seen_ts, is_body_only, is_muted
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 face_blob,
@@ -372,6 +420,7 @@ class IdentityStore:
                 ts,
                 ts,
                 1 if face_emb is None else 0,
+                0,
             ),
             wait=True,
         )
@@ -384,6 +433,7 @@ class IdentityStore:
                 "created_ts": ts,
                 "last_seen_ts": ts,
                 "is_body_only": face_emb is None,
+                "is_muted": False,
             }
             if norm_face is not None:
                 self.face_ids.append(ident_id)
@@ -391,6 +441,7 @@ class IdentityStore:
             if norm_body is not None:
                 self.body_ids.append(ident_id)
                 self.body_matrix = np.vstack([self.body_matrix, norm_body])
+        self._emit_change("identity_added", int(ident_id))
 
         return ident_id
 
@@ -435,7 +486,67 @@ class IdentityStore:
                 "UPDATE identities SET face_sample_path=? WHERE id=?",
                 (path, ident_id),
                 wait=False,
+                on_commit_event=("face_sample_path_updated", int(ident_id)),
             )
+
+    def update_body_sample_path(self, ident_id: int, path: str) -> None:
+        with self.lock:
+            if ident_id in self._row_cache:
+                self._row_cache[ident_id]["body_sample_path"] = path
+        if not self.ephemeral:
+            self._enqueue(
+                "UPDATE identities SET body_sample_path=? WHERE id=?",
+                (path, ident_id),
+                wait=False,
+                on_commit_event=("body_sample_path_updated", int(ident_id)),
+            )
+
+    def set_identity_muted(self, ident_id: int, muted: bool) -> bool:
+        ident_int = int(ident_id)
+        muted_value = bool(muted)
+        with self.lock:
+            if ident_int not in self._row_cache:
+                return False
+            self._row_cache[ident_int]["is_muted"] = muted_value
+        if not self.ephemeral:
+            self._enqueue(
+                "UPDATE identities SET is_muted=? WHERE id=?",
+                (1 if muted_value else 0, ident_int),
+                wait=False,
+                on_commit_event=("identity_muted" if muted_value else "identity_unmuted", ident_int),
+            )
+        return True
+
+    def is_identity_muted(self, ident_id: int) -> bool:
+        ident_int = int(ident_id)
+        with self.lock:
+            row = self._row_cache.get(ident_int)
+            return bool(row.get("is_muted")) if row else False
+
+    def has_identity(self, ident_id: int) -> bool:
+        ident_int = int(ident_id)
+        with self.lock:
+            return ident_int in self._row_cache
+
+    def register_change_listener(self, callback: Callable[[str, int], None]) -> None:
+        if callback is None:
+            return
+        with self._listeners_lock:
+            if callback not in self._change_listeners:
+                self._change_listeners.append(callback)
+
+    def unregister_change_listener(self, callback: Callable[[str, int], None]) -> None:
+        with self._listeners_lock:
+            self._change_listeners = [cb for cb in self._change_listeners if cb != callback]
+
+    def _emit_change(self, event_name: str, ident_id: int) -> None:
+        with self._listeners_lock:
+            listeners = list(self._change_listeners)
+        for callback in listeners:
+            try:
+                callback(str(event_name), int(ident_id))
+            except Exception:
+                LOGGER.debug("Identity change listener failed", exc_info=True)
 
     def find_best_face(self, face_emb: np.ndarray) -> Tuple[Optional[int], float]:
         query = self._coerce_dim(face_emb, 128)
@@ -443,8 +554,17 @@ class IdentityStore:
             if self.face_matrix.shape[0] == 0:
                 return None, -1.0
             sims = self.face_matrix @ query
-            idx = int(np.argmax(sims))
-            return self.face_ids[idx], float(sims[idx])
+            best_id: Optional[int] = None
+            best_score = -1.0
+            for idx, ident_id in enumerate(self.face_ids):
+                row = self._row_cache.get(int(ident_id))
+                if row is not None and bool(row.get("is_muted", False)):
+                    continue
+                score = float(sims[idx])
+                if score > best_score:
+                    best_score = score
+                    best_id = int(ident_id)
+            return best_id, best_score
 
     def find_best_body(self, body_emb: np.ndarray) -> Tuple[Optional[int], float]:
         query = self._coerce_dim(body_emb, 256)
@@ -452,8 +572,17 @@ class IdentityStore:
             if self.body_matrix.shape[0] == 0:
                 return None, -1.0
             sims = self.body_matrix @ query
-            idx = int(np.argmax(sims))
-            return self.body_ids[idx], float(sims[idx])
+            best_id: Optional[int] = None
+            best_score = -1.0
+            for idx, ident_id in enumerate(self.body_ids):
+                row = self._row_cache.get(int(ident_id))
+                if row is not None and bool(row.get("is_muted", False)):
+                    continue
+                score = float(sims[idx])
+                if score > best_score:
+                    best_score = score
+                    best_id = int(ident_id)
+            return best_id, best_score
 
     def list_identities(self) -> List[Dict[str, object]]:
         with self.lock:
@@ -523,6 +652,30 @@ def update_body_ema(ident_id: int, body_emb: np.ndarray, alpha: float = 0.2) -> 
 
 def update_face_sample_path(ident_id: int, path: str) -> None:
     _store().update_face_sample_path(ident_id=ident_id, path=path)
+
+
+def update_body_sample_path(ident_id: int, path: str) -> None:
+    _store().update_body_sample_path(ident_id=ident_id, path=path)
+
+
+def set_identity_muted(ident_id: int, muted: bool) -> bool:
+    return _store().set_identity_muted(ident_id=ident_id, muted=muted)
+
+
+def is_identity_muted(ident_id: int) -> bool:
+    return _store().is_identity_muted(ident_id=ident_id)
+
+
+def identity_exists(ident_id: int) -> bool:
+    return _store().has_identity(ident_id=ident_id)
+
+
+def register_change_listener(callback: Callable[[str, int], None]) -> None:
+    _store().register_change_listener(callback)
+
+
+def unregister_change_listener(callback: Callable[[str, int], None]) -> None:
+    _store().unregister_change_listener(callback)
 
 
 def list_identities() -> List[Dict[str, object]]:

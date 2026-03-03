@@ -9,7 +9,8 @@
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "jest --runInBand",
-    "mock": "node mock/server.js"
+    "mock": "node mock/server.js",
+    "perf:gate": "python scripts/perf/run_phase6_gate.py --config config.yaml --seconds 60 --output-dir artifacts/perf"
   },
   "dependencies": {
     "@headlessui/react": "^2.2.0",
