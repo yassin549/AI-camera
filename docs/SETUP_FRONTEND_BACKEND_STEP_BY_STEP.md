@@ -27,9 +27,7 @@ Copy the output and keep it safe.
 - Node.js 18+ installed
 - Docker Desktop installed (for Janus)
 - Vercel account + Vercel CLI (`npm i -g vercel`) or Git integration
-- One tunnel tool:
-  - Cloudflare Tunnel (`cloudflared`)
-  - or Tailscale Funnel (`tailscale`)
+- ngrok installed (`ngrok`)
 
 ## 3) Backend local env file
 Create a local backend env file from template:
@@ -46,7 +44,7 @@ CORS_ORIGINS=https://your-project.vercel.app,http://localhost:5173,http://127.0.
 AICAM_CAPTURE_BUFFER=1
 AICAM_WS_MAX_CLIENTS=64
 AICAM_WS_HEARTBEAT_SEC=10
-AICAM_ENABLE_FRAME_STREAMING=1
+AICAM_ENABLE_FRAME_STREAMING=0
 ```
 
 Important:
@@ -110,18 +108,25 @@ Why:
 - Janus converts camera transport to browser-friendly WebRTC.
 
 ## 6) Expose backend publicly (for Vercel frontend)
-Use a named Cloudflare Tunnel (persistent):
+Authenticate ngrok once:
 
 ```powershell
-cloudflared tunnel login
-cloudflared tunnel create aicam
-cloudflared tunnel route dns aicam api.your-domain.example.com
-cloudflared tunnel route dns aicam janus-api.your-domain.example.com
-# copy cloudflared\config.yml.example to cloudflared\config.yml
-scripts\run-tunnel.bat
+ngrok config add-authtoken <YOUR_NGROK_TOKEN>
 ```
 
-Use `https://api.your-domain.example.com` as `VITE_API_BASE`.
+Start tunnel (free random domain):
+
+```powershell
+ngrok http 8080
+```
+
+Or reserved domain:
+
+```powershell
+ngrok http --domain=<your-name>.ngrok-free.dev 8080
+```
+
+Use the resulting URL as `VITE_API_BASE`. If you use the backend `/janus` proxy, the same URL works for `VITE_JANUS_HTTP_URL`.
 
 ## 7) Frontend env values for Vercel
 Use `.env.vercel.example` as reference.
@@ -136,13 +141,15 @@ VITE_API_KEY=PASTE_THE_SAME_KEY_AS_BACKEND
 VITE_WS_METADATA_URL=wss://api.your-domain.example.com/api/realtime/ws
 VITE_METADATA_LATEST_URL=https://api.your-domain.example.com/api/realtime/latest
 VITE_METADATA_POLL_MS=250
-VITE_JANUS_HTTP_URL=https://janus-api.your-domain.example.com/janus
+VITE_JANUS_HTTP_URL=https://<your-ngrok-domain>/janus
+# Optional: use direct Janus WS signaling if you expose Janus separately.
+# VITE_JANUS_WS_URL=wss://<your-janus-domain>/janus
 VITE_JANUS_MOUNTPOINT=1
 VITE_DISABLE_JANUS=false
-VITE_DISABLE_BACKEND_VIDEO=false
+VITE_DISABLE_BACKEND_VIDEO=true
 VITE_DISABLE_WEBRTC=false
 VITE_VIDEO_PRIMARY_TRANSPORT=janus
-VITE_VIDEO_FALLBACK_TRANSPORT=wsjpeg
+VITE_VIDEO_FALLBACK_TRANSPORT=none
 ```
 
 Optional:
@@ -152,10 +159,10 @@ VITE_DISABLE_WEBRTC=false
 ```
 
 Notes:
-- Keep `VITE_VIDEO_PRIMARY_TRANSPORT=janus` with one explicit fallback (`wsjpeg`) for deterministic startup.
+- Keep `VITE_VIDEO_PRIMARY_TRANSPORT=janus` with fallback disabled (`none`) for Janus-only production; enable `wsjpeg` only if needed.
 - `VITE_API_KEY` must match backend `API_KEY`.
 - Raw `rtsp://` cannot be played by browsers; use Janus/HLS/MJPEG gateway URLs.
-- Cloudflare HTTP tunnel covers Janus signaling only; remote WebRTC media still requires STUN/TURN + UDP reachability.
+- ngrok HTTP tunnel covers Janus signaling only; remote WebRTC media still requires STUN/TURN + UDP reachability.
 
 ## 8) Deploy frontend to Vercel
 If using CLI:
@@ -215,3 +222,4 @@ No video:
 
 CORS errors:
 - Missing Vercel domain in `CORS_ORIGINS`.
+- If Janus is on a different domain, enable CORS in Janus HTTP transport or use the backend `/janus` proxy to keep signaling same-origin.

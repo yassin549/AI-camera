@@ -7,13 +7,14 @@ import re
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import cv2
 from fastapi import APIRouter, HTTPException, Request, Response, status
 from pydantic import BaseModel
 
 import db
+from api.media_utils import iter_media_candidates, resolve_media_url
 from config import DELETE_SAMPLE_FILES, is_api_key_valid
 
 LOGGER = logging.getLogger("aicam.api.identities")
@@ -124,57 +125,6 @@ def _format_iso(value: Optional[str]) -> str:
         return text
 
 
-def _path_to_media_url(raw_path: Optional[str], media_root: Path) -> Optional[str]:
-    if not raw_path:
-        return None
-    path = Path(str(raw_path))
-    candidates: List[Path] = []
-    if path.is_absolute():
-        try:
-            candidates.append(path.relative_to(media_root))
-        except Exception:
-            candidates = []
-    else:
-        candidates.append(Path(str(path).replace("\\", "/").lstrip("/")))
-    basename = path.name
-    if basename:
-        for subdir in ("faces", "body", "bodies", "samples/faces", "samples/bodies", "data/faces", "data/bodies"):
-            candidates.append(Path(subdir) / basename)
-
-    seen: Set[str] = set()
-    for candidate in candidates:
-        key = candidate.as_posix()
-        if key in seen:
-            continue
-        seen.add(key)
-        abs_candidate = media_root / candidate
-        try:
-            if abs_candidate.exists() and abs_candidate.is_file():
-                return f"/media/{key}"
-        except Exception:
-            continue
-    return None
-
-
-def _path_candidates(raw_path: Optional[str], media_root: Path) -> Iterable[Path]:
-    if not raw_path:
-        return []
-    path = Path(str(raw_path))
-    out: List[Path] = []
-    if path.is_absolute():
-        try:
-            out.append(media_root / path.relative_to(media_root))
-        except Exception:
-            pass
-    else:
-        out.append(media_root / Path(str(path).replace("\\", "/").lstrip("/")))
-    basename = path.name
-    if basename:
-        for subdir in ("faces", "body", "bodies", "samples/faces", "samples/bodies", "data/faces", "data/bodies"):
-            out.append(media_root / subdir / basename)
-    return out
-
-
 def _discover_samples_from_filesystem(identity_id: int, media_root: Path) -> Tuple[List[str], List[str]]:
     face_dirs = [
         media_root / "faces",
@@ -230,7 +180,7 @@ def _load_extra_samples(
     face_samples: List[str] = []
     body_samples: List[str] = []
     for row in rows_identity_samples:
-        sample_url = _path_to_media_url(row["sample_path"], media_root)
+        sample_url = resolve_media_url(row["sample_path"], media_root)
         if not sample_url:
             continue
         sample_type = str(row["sample_type"] or "").lower()
@@ -250,7 +200,7 @@ def _load_extra_samples(
         query = f"SELECT {path_col} AS sample_path, {type_expr} AS sample_type FROM samples WHERE {identity_col}=?"
         rows = conn.execute(query, (identity_id,)).fetchall()
         for row in rows:
-            sample_url = _path_to_media_url(row["sample_path"], media_root)
+            sample_url = resolve_media_url(row["sample_path"], media_root)
             if not sample_url:
                 continue
             kind = str(row["sample_type"] or "").lower()
@@ -307,8 +257,8 @@ def _row_to_payload(
     face_samples: List[str] = []
     body_samples: List[str] = []
 
-    face_single = _path_to_media_url(row["face_sample_path"], media_root)
-    body_single = _path_to_media_url(row["body_sample_path"], media_root)
+    face_single = resolve_media_url(row["face_sample_path"], media_root)
+    body_single = resolve_media_url(row["body_sample_path"], media_root)
     if face_single:
         face_samples.append(face_single)
     if body_single:
@@ -350,7 +300,7 @@ def _row_to_payload(
 
 def _remove_samples(paths: Sequence[Optional[str]], media_root: Path) -> None:
     for raw_path in paths:
-        for candidate in _path_candidates(raw_path, media_root):
+        for candidate in iter_media_candidates(raw_path, media_root):
             if candidate.exists():
                 try:
                     candidate.unlink()

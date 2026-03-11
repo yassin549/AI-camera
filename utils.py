@@ -283,7 +283,6 @@ class SharedTrackStore:
                     "last_seen_frame": int(st.last_seen_frame),
                     "age_frames": int(age_frames),
                     "age_ratio": float(age_ratio),
-                    "timestamp": timestamp_iso(),
                 }
             return payload
 

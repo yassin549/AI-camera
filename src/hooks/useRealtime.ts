@@ -31,6 +31,19 @@ function payloadSortKey(payload: MetadataPayload): number {
   return Number.isFinite(ts) ? ts : 0;
 }
 
+function payloadTimestampMs(payload: MetadataPayload): number | null {
+  const unix = Number(payload.capture_ts_unix);
+  if (Number.isFinite(unix) && unix > 0) {
+    return unix * 1000;
+  }
+  const text = payload.capture_ts ?? payload.timestamp;
+  if (!text) {
+    return null;
+  }
+  const parsed = Date.parse(String(text));
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
 function asNullableNumber(value: unknown): number | null {
   const parsed = Number(value);
   return Number.isFinite(parsed) ? parsed : null;
@@ -247,7 +260,15 @@ export function useRealtime(options: UseRealtimeOptions): UseRealtimeResult {
         const nextKey = payloadSortKey(payload);
         const prevKey = payloadSortKey(previous);
         if (nextKey < prevKey) {
-          return;
+          const nextTs = payloadTimestampMs(payload);
+          const prevTs = payloadTimestampMs(previous);
+          if (
+            nextTs === null ||
+            prevTs === null ||
+            nextTs <= prevTs + 1000
+          ) {
+            return;
+          }
         }
       }
       lastPayloadAtRef.current = Date.now();
@@ -260,7 +281,7 @@ export function useRealtime(options: UseRealtimeOptions): UseRealtimeResult {
         return;
       }
       try {
-        const response = await fetch(latestUrl, { method: "GET", headers });
+        const response = await fetch(latestUrl, { method: "GET", headers, cache: "no-store" });
         if (!response.ok) {
           return;
         }

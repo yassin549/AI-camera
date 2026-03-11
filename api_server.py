@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import queue
 import sqlite3
@@ -16,13 +17,16 @@ import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import uvicorn
 
 import db
 from api.identities import router as identities_router
 from api.janus_proxy import router as janus_proxy_router
+from api.media_utils import discover_face_thumb, resolve_media_url
 from api.media import mount_static_media, router as media_router
 from api.realtime import AIORTC_AVAILABLE, router as realtime_router
+from api.tracks import router as tracks_router
 from config import (
     APP_NAME,
     APP_VERSION,
@@ -55,98 +59,74 @@ def _utc_from_unix(ts: Optional[float]) -> Optional[str]:
     return datetime.fromtimestamp(value, tz=timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _to_media_url(raw_path: Optional[str], media_root: Path) -> Optional[str]:
-    if not raw_path:
-        return None
-
-    sample = Path(str(raw_path))
-    candidate_rel_paths: List[Path] = []
-    if sample.is_absolute():
-        try:
-            candidate_rel_paths.append(sample.relative_to(media_root))
-        except Exception:
-            candidate_rel_paths = []
-    else:
-        normalized = Path(str(sample).replace("\\", "/").lstrip("/"))
-        candidate_rel_paths.append(normalized)
-
-    if sample.name:
-        for subdir in ("faces", "body", "bodies", "samples/faces", "samples/bodies", "data/faces", "data/bodies"):
-            candidate_rel_paths.append(Path(subdir) / sample.name)
-
-    seen: Set[str] = set()
-    for rel in candidate_rel_paths:
-        rel_key = rel.as_posix()
-        if rel_key in seen:
-            continue
-        seen.add(rel_key)
-        candidate = media_root / rel
-        try:
-            if candidate.exists() and candidate.is_file():
-                return f"/media/{rel_key}"
-        except Exception:
-            continue
-    return None
-
-
-def _discover_face_thumb(identity_id: int, media_root: Path) -> Optional[str]:
-    search_dirs = [
-        media_root / "faces",
-        media_root / "data" / "faces",
-        media_root / "samples" / "faces",
-    ]
-    # Primary pattern: <id>_*.jpg (new convention)
-    # Legacy patterns: face_*_t*.jpg and yassin_* etc. are caught via DB path
-    patterns = [
-        f"{identity_id}_*.jpg", f"{identity_id}_*.jpeg", f"{identity_id}_*.png",
-        f"face_*_t{identity_id}.jpg", f"face_*_t{identity_id}.jpeg",
-    ]
-    for directory in search_dirs:
-        if not directory.exists() or not directory.is_dir():
-            continue
-        for pattern in patterns:
-            matches = sorted(directory.glob(pattern))
-            if not matches:
-                continue
-            candidate = matches[0]
-            try:
-                rel = candidate.relative_to(media_root)
-            except Exception:
-                continue
-            return f"/media/{rel.as_posix()}"
-    return None
-
-
 class MetadataHub:
-    """Thread-safe latest-snapshot publisher for low-latency websocket fanout."""
+    """Async-friendly metadata publisher with drop-old semantics."""
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._cond = threading.Condition(self._lock)
-        self._version = 0
         self._latest: Optional[Dict[str, Any]] = None
-
-    def publish(self, payload: Dict[str, Any]) -> None:
-        with self._cond:
-            self._version += 1
-            self._latest = payload
-            self._cond.notify_all()
+        self._latest_raw: Optional[str] = None
+        self._version = 0
+        self._subscribers: Set[asyncio.Queue] = set()
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def snapshot(self) -> Tuple[int, Optional[Dict[str, Any]]]:
         with self._lock:
             return self._version, dict(self._latest) if self._latest is not None else None
 
-    def wait_for_update(self, last_version: int, timeout: float) -> Tuple[int, Optional[Dict[str, Any]], bool]:
-        deadline = time.monotonic() + max(0.0, float(timeout))
-        with self._cond:
-            while self._version <= int(last_version):
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    payload = dict(self._latest) if self._latest is not None else None
-                    return self._version, payload, False
-                self._cond.wait(timeout=remaining)
-            payload = dict(self._latest) if self._latest is not None else None
-            return self._version, payload, True
+    def _queue_latest(self, queue: asyncio.Queue, payload: Dict[str, Any]) -> None:
+        try:
+            if queue.full():
+                _ = queue.get_nowait()
+        except Exception:
+            pass
+        try:
+            queue.put_nowait(payload)
+        except Exception:
+            pass
+
+    def publish(self, payload: Dict[str, Any]) -> None:
+        try:
+            raw_payload: Optional[str] = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+        except Exception:
+            raw_payload = None
+        with self._lock:
+            self._version += 1
+            self._latest = payload
+            self._latest_raw = raw_payload
+            subscribers = list(self._subscribers)
+            loop = self._loop
+
+        if not subscribers or loop is None:
+            return
+
+        for queue in subscribers:
+            try:
+                loop.call_soon_threadsafe(self._queue_latest, queue, raw_payload or payload)
+            except Exception:
+                continue
+
+    def subscribe(self) -> asyncio.Queue:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1)
+        with self._lock:
+            self._subscribers.add(queue)
+            if self._loop is None:
+                self._loop = loop
+            latest = self._latest_raw
+            if latest is None and self._latest is not None:
+                latest = dict(self._latest)
+
+        if latest is not None:
+            try:
+                queue.put_nowait(latest)
+            except Exception:
+                pass
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        with self._lock:
+            self._subscribers.discard(queue)
 
 
 class ApiRuntimeState:
@@ -168,8 +148,6 @@ class ApiRuntimeState:
         self.metrics = metrics
         self.track_store = track_store
 
-        self._tracks_lock = threading.RLock()
-        self._tracks: Dict[int, Dict[str, Any]] = {}
         self._capabilities_lock = threading.Lock()
         self._capabilities: Dict[str, Any] = dict(capabilities or {})
 
@@ -184,7 +162,8 @@ class ApiRuntimeState:
 
         self._client_lock = threading.Lock()
         self._mjpeg_clients = 0
-        self._ws_clients = 0
+        self._video_ws_clients = 0
+        self._metadata_ws_clients = 0
 
         self._frame_lock = threading.Lock()
         self._latest_frame: Optional[np.ndarray] = None
@@ -278,17 +257,33 @@ class ApiRuntimeState:
         with self._client_lock:
             self._mjpeg_clients = max(0, self._mjpeg_clients - 1)
 
-    def register_ws_client(self) -> None:
+    def register_video_ws_client(self) -> None:
         with self._client_lock:
-            self._ws_clients += 1
+            self._video_ws_clients += 1
 
-    def unregister_ws_client(self) -> None:
+    def unregister_video_ws_client(self) -> None:
         with self._client_lock:
-            self._ws_clients = max(0, self._ws_clients - 1)
+            self._video_ws_clients = max(0, self._video_ws_clients - 1)
 
-    def get_client_counts(self) -> Tuple[int, int]:
+    def register_metadata_ws_client(self) -> None:
         with self._client_lock:
-            return self._mjpeg_clients, self._ws_clients
+            self._metadata_ws_clients += 1
+
+    def unregister_metadata_ws_client(self) -> None:
+        with self._client_lock:
+            self._metadata_ws_clients = max(0, self._metadata_ws_clients - 1)
+
+    def get_video_client_counts(self) -> Tuple[int, int]:
+        with self._client_lock:
+            return self._mjpeg_clients, self._video_ws_clients
+
+    def get_metadata_ws_client_count(self) -> int:
+        with self._client_lock:
+            return int(self._metadata_ws_clients)
+
+    def get_client_counts(self) -> Tuple[int, int, int]:
+        with self._client_lock:
+            return self._mjpeg_clients, self._video_ws_clients, self._metadata_ws_clients
 
     def is_capture_running(self) -> bool:
         frame_ts = self._latest_frame_ts
@@ -384,7 +379,7 @@ class ApiRuntimeState:
 
             frame, frame_id, frame_ts = latest
             with self._client_lock:
-                video_clients = int(self._mjpeg_clients + self._ws_clients)
+                video_clients = int(self._mjpeg_clients + self._video_ws_clients)
             if video_clients <= 0:
                 with self._frame_lock:
                     self._latest_frame = frame
@@ -450,8 +445,10 @@ class ApiRuntimeState:
         return jpeg
 
     def get_tracks(self) -> List[Dict[str, Any]]:
-        with self._tracks_lock:
-            return [dict(v) for _, v in sorted(self._tracks.items())]
+        if self.track_store is None:
+            return []
+        payload = self.track_store.to_api_payload()
+        return [dict(v) for _, v in sorted(payload.items(), key=lambda item: int(item[0]))]
 
     def remap_identity(self, source_identity_id: int, target_identity_id: int) -> int:
         source_id = int(source_identity_id)
@@ -459,46 +456,61 @@ class ApiRuntimeState:
         if source_id == target_id:
             return 0
         updated = 0
-        if self.track_store is not None:
-            try:
-                updated += int(self.track_store.remap_identity(source_id, target_id))
-            except Exception:
-                LOGGER.debug("Failed to remap identity in shared track store", exc_info=True)
-        with self._tracks_lock:
-            for state in self._tracks.values():
-                if state.get("identity_id") is None:
-                    continue
-                try:
-                    if int(state.get("identity_id")) != source_id:
-                        continue
-                except Exception:
-                    continue
-                state["identity_id"] = target_id
-                updated += 1
+        if self.track_store is None:
+            return 0
+        try:
+            updated += int(self.track_store.remap_identity(source_id, target_id))
+        except Exception:
+            LOGGER.debug("Failed to remap identity in shared track store", exc_info=True)
         return updated
 
     def clear_identity(self, identity_id: int) -> int:
         ident_id = int(identity_id)
         cleared = 0
+        if self.track_store is None:
+            return 0
+        try:
+            cleared += int(self.track_store.clear_identity(ident_id))
+        except Exception:
+            LOGGER.debug("Failed to clear identity in shared track store", exc_info=True)
+        return cleared
+
+    def assign_track_identity(
+        self,
+        track_id: int,
+        identity_id: int,
+        cache_seconds: float = 30.0,
+        modality: str = "manual",
+        score: float = 1.0,
+    ) -> bool:
+        tid = int(track_id)
+        ident_id = int(identity_id)
+        assigned = False
+        with self._frame_lock:
+            frame_id = max(0, int(self._latest_frame_id))
+
         if self.track_store is not None:
             try:
-                cleared += int(self.track_store.clear_identity(ident_id))
+                states = self.track_store.snapshot()
+                exists = any(int(state.track_id) == tid for state in states)
+                if exists:
+                    self.track_store.assign_identity(
+                        track_id=tid,
+                        identity_id=ident_id,
+                        modality=str(modality),
+                        score=float(score),
+                        frame_id=frame_id,
+                        cache_seconds=max(0.0, float(cache_seconds)),
+                    )
+                    assigned = True
             except Exception:
-                LOGGER.debug("Failed to clear identity in shared track store", exc_info=True)
-        with self._tracks_lock:
-            for state in self._tracks.values():
-                if state.get("identity_id") is None:
-                    continue
-                try:
-                    if int(state.get("identity_id")) != ident_id:
-                        continue
-                except Exception:
-                    continue
-                state["identity_id"] = None
-                state["modality"] = "none"
-                state["last_score"] = 0.0
-                cleared += 1
-        return cleared
+                LOGGER.debug("Failed to assign identity in shared track store", exc_info=True)
+        if assigned:
+            try:
+                db.update_last_seen(ident_id, _utc_now_iso())
+            except Exception:
+                LOGGER.debug("Failed to update identity last_seen after manual track assignment", exc_info=True)
+        return assigned
 
     def publish_tracks(
         self,
@@ -656,9 +668,12 @@ class ApiRuntimeState:
         face_sample_path: Optional[str],
         body_sample_path: Optional[str],
     ) -> Optional[str]:
-        thumb = _to_media_url(face_sample_path, self.media_root) or _to_media_url(body_sample_path, self.media_root)
+        thumb = resolve_media_url(face_sample_path, self.media_root) or resolve_media_url(
+            body_sample_path,
+            self.media_root,
+        )
         if not thumb:
-            thumb = _discover_face_thumb(int(identity_id), self.media_root)
+            thumb = discover_face_thumb(int(identity_id), self.media_root)
         return thumb
 
     def _publisher_loop(self) -> None:
@@ -688,8 +703,6 @@ class ApiRuntimeState:
                     break
                 latest = nxt
             tracks_payload, frame_id, frame_shape, frame_ts = latest
-            with self._tracks_lock:
-                self._tracks = {int(k): dict(v) for k, v in tracks_payload.items()}
             try:
                 metadata = self._build_metadata_payload(
                     frame_id=frame_id,
@@ -735,12 +748,10 @@ class ApiRuntimeState:
                 x1, y1, x2, y2 = (0, 0, 0, 0)
 
             if identity_id is None:
-                label = f"Track {track_id}"
                 thumb = None
                 muted = False
             else:
                 ident_int = int(identity_id)
-                label = f"ID:{ident_int} ({score:.2f})"
                 thumb = thumb_cache.get(ident_int)
                 muted = bool(muted_cache.get(ident_int, False))
 
@@ -749,7 +760,6 @@ class ApiRuntimeState:
                     "track_id": track_id,
                     "bbox": [x1, y1, x2, y2],
                     "identity_id": None if identity_id is None else int(identity_id),
-                    "label": label,
                     "modality": modality,
                     "confidence": confidence,
                     "age_ratio": age_ratio,
@@ -786,6 +796,7 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
 
     app.include_router(janus_proxy_router, tags=["janus"])
     app.include_router(identities_router, prefix="/api/identities", tags=["identities"])
+    app.include_router(tracks_router, tags=["tracks"])
     app.include_router(media_router, tags=["media"])
     app.include_router(realtime_router, tags=["realtime"])
     mount_static_media(app, str(runtime.media_root))
@@ -807,6 +818,7 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
             "routes": [
                 "/api/identities",
                 "/api/identities/{id}",
+                "/api/tracks/{track_id}/assign",
                 "/api/realtime/ws",
                 "/webrtc/offer",
                 "/janus",
@@ -838,24 +850,20 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
         return {"ok": True, "capture": "running"}
 
     @app.get("/api/realtime/latest")
-    def api_realtime_latest() -> Dict[str, Any]:
+    def api_realtime_latest() -> JSONResponse:
         _, payload = runtime.metadata_hub.snapshot()
         if payload is None:
-            return {"timestamp": _utc_now_iso(), "tracks": []}
-        return payload
+            payload = {"timestamp": _utc_now_iso(), "tracks": []}
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @app.get("/api/tracks")
     def api_tracks() -> List[Dict[str, Any]]:
         return runtime.get_tracks()
 
-    @app.get("/tracks")
-    def tracks_legacy() -> List[Dict[str, Any]]:
-        return runtime.get_tracks()
-
     @app.get("/api/debug/status")
     def debug_status() -> Dict[str, Any]:
         media_root_exists = runtime.media_root.exists()
-        mjpeg_clients, ws_clients = runtime.get_client_counts()
+        mjpeg_clients, video_ws_clients, metadata_ws_clients = runtime.get_client_counts()
         try:
             conn = sqlite3.connect(runtime.db_path)
             row = conn.execute("SELECT COUNT(1) FROM identities").fetchone()
@@ -867,7 +875,9 @@ def create_app(runtime: ApiRuntimeState) -> FastAPI:
             "api_up": True,
             "media_root_exists": bool(media_root_exists),
             "mjpeg_clients": mjpeg_clients,
-            "ws_clients": ws_clients,
+            "video_ws_clients": video_ws_clients,
+            "metadata_ws_clients": metadata_ws_clients,
+            "ws_clients": int(video_ws_clients + metadata_ws_clients),
             "identities_count": identities_count,
             "frame_streaming_enabled": runtime.enable_frame_streaming,
             **runtime.get_capabilities(),

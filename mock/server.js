@@ -118,7 +118,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  if (method === "GET" && (url.pathname === "/mock/stream.mjpeg" || url.pathname === "/stream.mjpeg")) {
+  if (method === "GET" && (url.pathname === "/mock/stream.mjpeg" || url.pathname === "/api/media/mjpeg")) {
     withCors(res);
     res.writeHead(200, {
       "Cache-Control": "no-cache, no-store, must-revalidate",
@@ -229,7 +229,7 @@ const server = http.createServer((req, res) => {
   sendJson(res, 404, { error: "Not found" });
 });
 
-const ws = new WebSocketServer({ server, path: "/ws/metadata" });
+const ws = new WebSocketServer({ server, path: "/api/realtime/ws" });
 let frameId = 1;
 
 setInterval(() => {
@@ -251,7 +251,7 @@ server.listen(PORT, HOST, () => {
   // eslint-disable-next-line no-console
   console.log(`[mock] listening on http://${HOST}:${PORT}`);
   // eslint-disable-next-line no-console
-  console.log(`[mock] stream: http://${HOST}:${PORT}/stream.mjpeg`);
+  console.log(`[mock] stream: http://${HOST}:${PORT}/api/media/mjpeg`);
   // eslint-disable-next-line no-console
-  console.log(`[mock] metadata ws: ws://${HOST}:${PORT}/ws/metadata`);
+  console.log(`[mock] metadata ws: ws://${HOST}:${PORT}/api/realtime/ws`);
 });

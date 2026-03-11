@@ -1,169 +1,149 @@
 from __future__ import annotations
 
+import threading
+import time
 from pathlib import Path
 
-import cv2
 import numpy as np
 
-import db
-from main import RuntimeContext, TrackCache, _process_identity_for_track
+import recognition_worker
 from tracker_adapter import Track
-from embedder_face import FaceEmbedder
-from utils import cosine, save_np_to_blob, load_np_from_blob
+from utils import CounterFPS, FrameTimingStore, LatestFrameStore, SharedTrackStore, StageStats
 
 
-class _FaceDetectorSequence:
-    def __init__(self, sequence):
-        self.sequence = list(sequence)
-        self.idx = 0
+class _DummyFaceDetector:
+    def __init__(self, min_confidence: float = 0.5) -> None:
+        self.min_confidence = float(min_confidence)
+        self.available = True
 
     def detect(self, _rgb):
-        if self.idx >= len(self.sequence):
-            return []
-        value = self.sequence[self.idx]
-        self.idx += 1
-        return value
+        return []
 
-    def close(self):
+    def close(self) -> None:
         return None
 
 
-class _FaceEmbedderConstant:
-    def __init__(self, emb: np.ndarray):
-        self.emb = emb.astype(np.float32)
+class _DummyFaceEmbedder:
+    def __init__(self, **_: object) -> None:
+        pass
 
     def embed_from_bgr(self, _bgr):
-        return self.emb
+        return None
 
 
-class _Dummy:
-    pass
+def _build_worker(monkeypatch, tmp_path: Path, cfg_overrides: dict[str, object] | None = None):
+    monkeypatch.setattr(recognition_worker, "FaceROIDetector", _DummyFaceDetector)
+    monkeypatch.setattr(recognition_worker, "FaceEmbedder", _DummyFaceEmbedder)
 
+    frame_store = LatestFrameStore()
+    track_store = SharedTrackStore(max_age_frames=24)
+    stop_event = threading.Event()
 
-def _base_cfg(tmp_path: Path):
-    return {
+    cfg: dict[str, object] = {
+        "target_fps": 30.0,
         "face_interval_frames": 1,
-        "body_interval_frames": 1,
-        "cache_seconds": 0,
-        "face_threshold": 0.60,
-        "face_threshold_high": 0.72,
-        "body_threshold": 0.40,
-        "face_top_ratio": 0.50,
+        "body_interval_frames": 10,
+        "face_threshold": 0.6,
+        "body_threshold": 0.4,
+        "cache_seconds": 0.0,
         "persist_body_only": False,
+        "disable_body_embedding": True,
         "faces_dir": str(tmp_path / "faces"),
     }
-
-
-def _make_ctx(tmp_path: Path, cfg_overrides=None, face_detector=None, face_embedder=None):
-    cfg = _base_cfg(tmp_path)
     if cfg_overrides:
         cfg.update(cfg_overrides)
 
-    db_path = tmp_path / "identities_test.db"
-    db.configure(str(db_path), ephemeral=False)
-    db.init_db()
-    db.load_all_embeddings()
-
-    ctx = RuntimeContext(
-        config=cfg,
-        detector=_Dummy(),
-        tracker=_Dummy(),
-        face_detector=face_detector or _FaceDetectorSequence([[]]),
-        face_embedder=face_embedder or _FaceEmbedderConstant(np.ones(128, dtype=np.float32) / np.sqrt(128.0)),
-        api_state=_Dummy(),
-        track_cache={},
+    worker = recognition_worker.RecognitionWorker(
+        frame_store=frame_store,
+        track_store=track_store,
+        cfg=cfg,
+        timing_store=FrameTimingStore(),
+        stage_stats=StageStats(),
+        fps_counter=CounterFPS(),
+        stop_event=stop_event,
+        metrics=None,
     )
-    return ctx
+    return worker, frame_store, track_store, stop_event
 
 
-def test_multiple_faces_produce_different_embeddings():
-    embedder = FaceEmbedder()
-
-    img_a = np.full((96, 96, 3), (20, 40, 220), dtype=np.uint8)
-    img_b = np.full((96, 96, 3), (220, 40, 20), dtype=np.uint8)
-
-    emb_a = embedder.embed_from_bgr(img_a)
-    emb_b = embedder.embed_from_bgr(img_b)
-
-    assert emb_a is not None
-    assert emb_b is not None
-    assert emb_a.shape[0] == 128
-    assert emb_b.shape[0] == 128
-    assert cosine(emb_a, emb_b) < 0.999
+def _wait_until(predicate, timeout_sec: float = 1.0) -> bool:
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return bool(predicate())
 
 
-def test_track_no_face_then_face_links_existing_identity(tmp_path: Path):
-    face_vec = np.zeros((128,), dtype=np.float32)
-    face_vec[0] = 1.0
-    body_vec = np.zeros((256,), dtype=np.float32)
-    body_vec[1] = 1.0
-
-    ctx = _make_ctx(
+def test_recognition_does_not_drop_tracks_only_by_frame_gap(monkeypatch, tmp_path: Path) -> None:
+    worker, frame_store, track_store, stop_event = _build_worker(
+        monkeypatch,
         tmp_path,
-        face_detector=_FaceDetectorSequence([[], [(5, 5, 40, 40, 0.95)]]),
-        face_embedder=_FaceEmbedderConstant(face_vec),
+        cfg_overrides={
+            "recognition_stale_age_ratio": 1.0,
+            "recognition_stale_seconds": 0.5,
+        },
+    )
+    calls: list[int] = []
+
+    def _fake_extract(*_args, **_kwargs):
+        calls.append(1)
+        stop_event.set()
+        return None
+
+    worker._extract_face_embedding = _fake_extract  # type: ignore[assignment]
+    track_store.update_from_tracker(
+        [Track(track_id=1, bbox=(10, 10, 100, 160), score=0.9, feature=None)],
+        frame_id=1,
+        max_tracks=20,
+        max_age_frames=24,
     )
 
-    existing_id = db.add_identity(face_vec, body_vec, None, None, "2026-02-22T00:00:00+00:00")
-    db.load_all_embeddings()
+    thread = threading.Thread(target=worker._run, daemon=True)
+    thread.start()
+    frame_store.publish(frame_id=5, frame=np.zeros((180, 120, 3), dtype=np.uint8), ts=time.time())
 
-    frame = np.full((180, 120, 3), 127, dtype=np.uint8)
-    track = Track(track_id=1, bbox=(10, 10, 100, 170), score=0.9, feature=body_vec)
-
-    first = _process_identity_for_track(ctx, frame, track, frame_idx=0)
-    second = _process_identity_for_track(ctx, frame, track, frame_idx=2)
-
-    assert first["identity_id"] in (None, existing_id)
-    assert second["identity_id"] == existing_id
-    assert second["modality"] == "face"
+    assert _wait_until(lambda: len(calls) == 1, timeout_sec=1.2)
+    stop_event.set()
+    thread.join(timeout=1.0)
+    assert len(calls) == 1
 
 
-def test_short_video_pipeline_insert_then_recognize(tmp_path: Path):
-    video_path = tmp_path / "tiny.mp4"
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(str(video_path), fourcc, 5.0, (160, 120))
-    for _ in range(3):
-        frame = np.full((120, 160, 3), 160, dtype=np.uint8)
-        cv2.rectangle(frame, (20, 10), (110, 110), (0, 255, 0), 2)
-        writer.write(frame)
-    writer.release()
-
-    face_vec = np.zeros((128,), dtype=np.float32)
-    face_vec[5] = 1.0
-    body_vec = np.zeros((256,), dtype=np.float32)
-    body_vec[7] = 1.0
-
-    ctx = _make_ctx(
+def test_recognition_suppresses_stale_tracks_by_time_and_age(monkeypatch, tmp_path: Path) -> None:
+    worker, frame_store, track_store, stop_event = _build_worker(
+        monkeypatch,
         tmp_path,
-        face_detector=_FaceDetectorSequence([[(4, 4, 32, 32, 0.9)], [(4, 4, 32, 32, 0.9)], [(4, 4, 32, 32, 0.9)]]),
-        face_embedder=_FaceEmbedderConstant(face_vec),
+        cfg_overrides={
+            "recognition_stale_age_ratio": 0.2,
+            "recognition_stale_seconds": 0.05,
+        },
+    )
+    calls: list[int] = []
+
+    def _fake_extract(*_args, **_kwargs):
+        calls.append(1)
+        return None
+
+    worker._extract_face_embedding = _fake_extract  # type: ignore[assignment]
+    track_store.update_from_tracker(
+        [Track(track_id=4, bbox=(20, 15, 110, 170), score=0.92, feature=None)],
+        frame_id=1,
+        max_tracks=20,
+        max_age_frames=24,
     )
 
-    cap = cv2.VideoCapture(str(video_path))
-    ids = []
-    frame_idx = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        track_id = 1 if frame_idx == 0 else 2
-        track = Track(track_id=track_id, bbox=(20, 10, 110, 110), score=0.9, feature=body_vec)
-        result = _process_identity_for_track(ctx, frame, track, frame_idx=frame_idx)
-        ids.append(result["identity_id"])
-        frame_idx += 1
-    cap.release()
+    thread = threading.Thread(target=worker._run, daemon=True)
+    thread.start()
 
-    assert ids[0] is not None
-    assert ids[1] == ids[0]
+    frame_store.publish(frame_id=8, frame=np.zeros((180, 120, 3), dtype=np.uint8), ts=time.time())
+    assert _wait_until(lambda: len(calls) >= 1, timeout_sec=1.2)
+    first_calls = len(calls)
+    assert first_calls == 1
 
-    # BLOB roundtrip validation
-    blob = save_np_to_blob(face_vec)
-    restored = load_np_from_blob(blob)
-    assert restored.dtype == np.float32
-    assert restored.shape == face_vec.shape
-    assert np.allclose(restored, face_vec)
+    time.sleep(0.08)
+    frame_store.publish(frame_id=9, frame=np.zeros((180, 120, 3), dtype=np.uint8), ts=time.time())
+    time.sleep(0.15)
 
-    db.load_all_embeddings()
-    best_id, best_score = db.find_best_face(face_vec)
-    assert best_id == ids[0]
-    assert best_score >= 0.99
+    stop_event.set()
+    thread.join(timeout=1.0)
+    assert len(calls) == first_calls

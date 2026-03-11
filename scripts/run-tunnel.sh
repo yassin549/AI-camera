@@ -1,14 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="$ROOT_DIR/cloudflared/config.yml"
+PORT="${1:-8080}"
 
-if [[ ! -f "$CONFIG_FILE" ]]; then
-  echo "[ERROR] Missing cloudflared config file: $CONFIG_FILE"
-  echo "Copy cloudflared/config.yml.example to cloudflared/config.yml and fill tunnel values first."
+if ! command -v ngrok >/dev/null 2>&1; then
+  echo "[ERROR] ngrok is not installed or not on PATH."
+  echo "Install ngrok and run: ngrok config add-authtoken <YOUR_NGROK_TOKEN>"
   exit 1
 fi
 
-cloudflared tunnel --config "$CONFIG_FILE" run
-
+echo "[INFO] Starting ngrok HTTP tunnel on port ${PORT}"
+ngrok http "${PORT}"

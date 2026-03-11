@@ -8,7 +8,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, Optional, Set, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -91,10 +91,31 @@ class RecognitionWorker:
         self.face_interval = int(cfg.get("face_interval_frames", 4))
         self.body_interval = int(cfg.get("body_interval_frames", 10))
         target_fps = max(1.0, float(cfg.get("target_fps", 30.0)))
+        self.target_fps = float(target_fps)
+        self.track_max_age_frames = max(
+            1,
+            int(getattr(self.track_store, "max_age_frames", cfg.get("max_track_age_frames", 24))),
+        )
         self.face_interval_seconds = max(0.01, float(self.face_interval) / target_fps)
         self.body_interval_seconds = max(0.01, float(self.body_interval) / target_fps)
+        self.face_retry_min_seconds = max(
+            0.01,
+            float(cfg.get("face_retry_min_seconds", self.face_interval_seconds * 0.7)),
+        )
+        self.body_retry_min_seconds = max(
+            0.01,
+            float(cfg.get("body_retry_min_seconds", self.body_interval_seconds * 0.7)),
+        )
         self.face_threshold = float(cfg.get("face_threshold", 0.60))
         self.body_threshold = float(cfg.get("body_threshold", 0.40))
+        self.recognition_stale_age_ratio = min(
+            1.0,
+            max(0.0, float(cfg.get("recognition_stale_age_ratio", 0.6))),
+        )
+        self.recognition_stale_seconds = max(
+            0.05,
+            float(cfg.get("recognition_stale_seconds", max(self.face_interval_seconds * 3.0, 0.35))),
+        )
         self.cache_seconds = float(cfg.get("cache_seconds", 30))
         self.top_ratio = float(cfg.get("face_top_ratio", 0.68))
         self.min_face_pixels = int(cfg.get("face_min_pixels", 40))
@@ -102,10 +123,40 @@ class RecognitionWorker:
         self.persist_body_only = bool(cfg.get("persist_body_only", True))
         self.body_fallback_enabled = bool(cfg.get("body_fallback_enabled", True))
         self.body_fallback_after_face_failures = int(cfg.get("body_fallback_after_face_failures", 3))
+        self.body_fallback_age_ratio = min(
+            1.0,
+            max(0.0, float(cfg.get("body_fallback_age_ratio", 0.35))),
+        )
+        self.body_fallback_unresolved_seconds = max(
+            0.1,
+            float(
+                cfg.get(
+                    "body_fallback_unresolved_seconds",
+                    max(self.face_interval_seconds * max(2, self.body_fallback_after_face_failures), 0.8),
+                )
+            ),
+        )
+        self.pending_identity_ttl_seconds = max(
+            0.5,
+            float(cfg.get("recognition_pending_identity_ttl_seconds", 8.0)),
+        )
+        self.identity_create_cooldown_seconds = max(
+            0.0,
+            float(
+                cfg.get(
+                    "recognition_identity_create_cooldown_seconds",
+                    max(self.face_interval_seconds, self.body_interval_seconds),
+                )
+            ),
+        )
         self.faces_dir = ensure_dir(str(cfg.get("faces_dir", "./faces")))
         self._face_failures: Dict[int, int] = {}
         self._last_face_attempt_ts: Dict[int, float] = {}
         self._last_body_attempt_ts: Dict[int, float] = {}
+        self._track_first_seen_ts: Dict[int, float] = {}
+        self._track_last_seen_ts: Dict[int, float] = {}
+        self._track_last_seen_frame: Dict[int, int] = {}
+        self._last_identity_create_ts: Dict[int, float] = {}
 
         self.persist_queue_size = max(16, int(cfg.get("recognition_persist_queue_size", 512)))
         self.persist_batch_size = max(1, int(cfg.get("recognition_persist_batch_size", 16)))
@@ -116,7 +167,7 @@ class RecognitionWorker:
         self._media_queue: "queue.Queue[Optional[_MediaJob]]" = queue.Queue(maxsize=self.media_queue_size)
 
         self._pending_lock = threading.Lock()
-        self._pending_identity_tracks: Set[int] = set()
+        self._pending_identity_tracks: Dict[int, float] = {}
 
         self._thread: Optional[threading.Thread] = None
         self._persist_thread: Optional[threading.Thread] = None
@@ -165,25 +216,38 @@ class RecognitionWorker:
             tracks = self.track_store.snapshot()
             now = time.time()
             active_track_ids = {int(st.track_id) for st in tracks}
-            stale_failure_keys = [tid for tid in self._face_failures if tid not in active_track_ids]
-            for tid in stale_failure_keys:
-                self._face_failures.pop(tid, None)
-                self._last_face_attempt_ts.pop(tid, None)
-                self._last_body_attempt_ts.pop(tid, None)
-                self._clear_pending_track(tid)
+            self._cleanup_inactive_track_state(active_track_ids)
 
             for st in tracks:
-                # Ignore stale tracks.
-                if frame_id - int(st.last_seen_frame) > 2:
+                track_id = int(st.track_id)
+                last_seen_frame = int(st.last_seen_frame)
+                track_age_frames = max(0, frame_id - last_seen_frame)
+                track_age_ratio = min(1.0, float(track_age_frames) / float(max(1, self.track_max_age_frames)))
+
+                if track_id not in self._track_first_seen_ts:
+                    self._track_first_seen_ts[track_id] = now
+                last_seen_frame_prev = self._track_last_seen_frame.get(track_id)
+                if last_seen_frame_prev is None or last_seen_frame > last_seen_frame_prev:
+                    self._track_last_seen_frame[track_id] = last_seen_frame
+                    self._track_last_seen_ts[track_id] = now
+                unresolved_seconds = max(0.0, now - float(self._track_first_seen_ts.get(track_id, now)))
+                last_seen_age_seconds = max(0.0, now - float(self._track_last_seen_ts.get(track_id, now)))
+
+                # Freshness gate: use age ratio + elapsed wall time instead of strict frame cutoff.
+                if (
+                    track_age_ratio >= self.recognition_stale_age_ratio
+                    and last_seen_age_seconds >= self.recognition_stale_seconds
+                ):
+                    self._inc_metric("suppressed_stale_tracks", 1)
                     continue
 
-                if self._is_track_pending(st.track_id):
+                if self._is_track_pending(track_id):
                     self._inc_metric("recognition_pending_identity", 1)
                     continue
 
                 if st.identity_id is not None and not db.identity_exists(int(st.identity_id)):
                     self.track_store.assign_identity(
-                        track_id=st.track_id,
+                        track_id=track_id,
                         identity_id=None,
                         modality="none",
                         score=0.0,
@@ -207,41 +271,51 @@ class RecognitionWorker:
 
                 # Event-driven trigger: new track or unresolved track at rate limit.
                 should_try_face = bool(st.is_new) or st.identity_id is None
-                last_face_try_ts = float(self._last_face_attempt_ts.get(st.track_id, 0.0))
+                last_face_try_ts = float(self._last_face_attempt_ts.get(track_id, 0.0))
                 face_due_by_frame = frame_id - int(st.last_face_frame) >= self.face_interval
                 face_due_by_time = (now - last_face_try_ts) >= self.face_interval_seconds
-                if should_try_face and face_due_by_frame and face_due_by_time:
+                face_retry_cooldown_ok = (now - last_face_try_ts) >= self.face_retry_min_seconds
+                if should_try_face and face_retry_cooldown_ok and (face_due_by_frame or face_due_by_time):
                     t0 = time.perf_counter()
-                    self.track_store.mark_face_checked(st.track_id, frame_id)
-                    self._last_face_attempt_ts[st.track_id] = now
+                    self.track_store.mark_face_checked(track_id, frame_id)
+                    self._last_face_attempt_ts[track_id] = now
                     self._inc_metric("recognition_attempts", 1)
                     self._inc_metric("face_attempts", 1)
                     face_emb = self._extract_face_embedding(frame, st.bbox)
                     if face_emb is not None:
-                        self._match_or_create_face_async(st.track_id, face_emb, frame, st.bbox, frame_id)
-                        self._face_failures[st.track_id] = 0
+                        self._match_or_create_face_async(track_id, face_emb, frame, st.bbox, frame_id)
+                        self._face_failures[track_id] = 0
+                        rec_ms_total += (time.perf_counter() - t0) * 1000.0
+                        continue
                     else:
-                        self._face_failures[st.track_id] = int(self._face_failures.get(st.track_id, 0)) + 1
+                        self._face_failures[track_id] = int(self._face_failures.get(track_id, 0)) + 1
                     rec_ms_total += (time.perf_counter() - t0) * 1000.0
-                    continue
 
                 # Optional body-only association path.
+                face_failures = int(self._face_failures.get(track_id, 0))
                 should_try_body_fallback = (
                     self.body_fallback_enabled
                     and not self.disable_body_embedding
                     and st.feature is not None
-                    and int(self._face_failures.get(st.track_id, 0)) >= self.body_fallback_after_face_failures
+                    and st.identity_id is None
+                    and (
+                        not self.face_detector_available
+                        or face_failures >= self.body_fallback_after_face_failures
+                        or track_age_ratio >= self.body_fallback_age_ratio
+                        or unresolved_seconds >= self.body_fallback_unresolved_seconds
+                    )
                 )
                 if should_try_body_fallback:
-                    last_body_try_ts = float(self._last_body_attempt_ts.get(st.track_id, 0.0))
+                    last_body_try_ts = float(self._last_body_attempt_ts.get(track_id, 0.0))
                     body_due_by_frame = frame_id - int(st.last_body_frame) >= self.body_interval
                     body_due_by_time = (now - last_body_try_ts) >= self.body_interval_seconds
-                    if body_due_by_frame and body_due_by_time:
+                    body_retry_cooldown_ok = (now - last_body_try_ts) >= self.body_retry_min_seconds
+                    if body_retry_cooldown_ok and (body_due_by_frame or body_due_by_time):
                         t0 = time.perf_counter()
-                        self.track_store.mark_body_checked(st.track_id, frame_id)
-                        self._last_body_attempt_ts[st.track_id] = now
+                        self.track_store.mark_body_checked(track_id, frame_id)
+                        self._last_body_attempt_ts[track_id] = now
                         self._inc_metric("recognition_attempts", 1)
-                        self._match_body_async(st.track_id, st.feature, frame_id)
+                        self._match_body_async(track_id, st.feature, frame_id)
                         rec_ms_total += (time.perf_counter() - t0) * 1000.0
 
             self.timing_store.set(frame_id, "recognition_ms", rec_ms_total)
@@ -400,23 +474,66 @@ class RecognitionWorker:
             LOGGER.debug("Media queue full; dropping sample for identity_id=%s", job.identity_id)
             return False
 
-    def _mark_track_pending(self, track_id: int) -> bool:
-        tid = int(track_id)
+    def _cleanup_inactive_track_state(self, active_track_ids: set[int]) -> None:
         with self._pending_lock:
-            if tid in self._pending_identity_tracks:
+            pending_ids = set(self._pending_identity_tracks.keys())
+        tracked_ids = (
+            set(self._face_failures)
+            | set(self._last_face_attempt_ts)
+            | set(self._last_body_attempt_ts)
+            | set(self._track_first_seen_ts)
+            | set(self._track_last_seen_ts)
+            | set(self._track_last_seen_frame)
+            | set(self._last_identity_create_ts)
+            | pending_ids
+        )
+        for tid in tracked_ids:
+            if tid in active_track_ids:
+                continue
+            self._face_failures.pop(tid, None)
+            self._last_face_attempt_ts.pop(tid, None)
+            self._last_body_attempt_ts.pop(tid, None)
+            self._track_first_seen_ts.pop(tid, None)
+            self._track_last_seen_ts.pop(tid, None)
+            self._track_last_seen_frame.pop(tid, None)
+            self._last_identity_create_ts.pop(tid, None)
+            self._clear_pending_track(tid)
+
+    def _allow_identity_create_attempt(self, track_id: int, now_ts: Optional[float] = None) -> bool:
+        tid = int(track_id)
+        now = time.time() if now_ts is None else float(now_ts)
+        last = float(self._last_identity_create_ts.get(tid, 0.0))
+        if (now - last) < self.identity_create_cooldown_seconds:
+            return False
+        self._last_identity_create_ts[tid] = now
+        return True
+
+    def _mark_track_pending(self, track_id: int, now_ts: Optional[float] = None) -> bool:
+        tid = int(track_id)
+        now = time.time() if now_ts is None else float(now_ts)
+        with self._pending_lock:
+            existing = self._pending_identity_tracks.get(tid)
+            if existing is not None and (now - existing) <= self.pending_identity_ttl_seconds:
                 return False
-            self._pending_identity_tracks.add(tid)
+            self._pending_identity_tracks[tid] = now
         return True
 
     def _clear_pending_track(self, track_id: int) -> None:
         tid = int(track_id)
         with self._pending_lock:
-            self._pending_identity_tracks.discard(tid)
+            self._pending_identity_tracks.pop(tid, None)
 
     def _is_track_pending(self, track_id: int) -> bool:
         tid = int(track_id)
+        now = time.time()
         with self._pending_lock:
-            return tid in self._pending_identity_tracks
+            existing = self._pending_identity_tracks.get(tid)
+            if existing is None:
+                return False
+            if (now - existing) > self.pending_identity_ttl_seconds:
+                self._pending_identity_tracks.pop(tid, None)
+                return False
+            return True
 
     def _extract_face_embedding(
         self,
@@ -509,7 +626,11 @@ class RecognitionWorker:
             )
             return
 
-        if not self._mark_track_pending(track_id):
+        now = time.time()
+        if not self._allow_identity_create_attempt(track_id, now_ts=now):
+            self._inc_metric("identity_create_cooled_down", 1)
+            return
+        if not self._mark_track_pending(track_id, now_ts=now):
             return
 
         x1, y1, x2, y2 = [int(v) for v in person_bbox]
@@ -564,7 +685,11 @@ class RecognitionWorker:
             return
 
         if self.persist_body_only:
-            if not self._mark_track_pending(track_id):
+            now = time.time()
+            if not self._allow_identity_create_attempt(track_id, now_ts=now):
+                self._inc_metric("identity_create_cooled_down", 1)
+                return
+            if not self._mark_track_pending(track_id, now_ts=now):
                 return
             queued = self._enqueue_persist(
                 _PersistJob(

@@ -108,8 +108,8 @@ async def _stream_mjpeg_impl(request: Request) -> StreamingResponse:
     if not ENABLE_FRAME_STREAMING:
         raise HTTPException(status_code=503, detail="frame_streaming_disabled")
     runtime = _runtime(request)
-    mjpeg_clients, ws_clients = runtime.get_client_counts()
-    if (mjpeg_clients + ws_clients) >= MJPEG_MAX_CLIENTS:
+    mjpeg_clients, video_ws_clients = runtime.get_video_client_counts()
+    if (mjpeg_clients + video_ws_clients) >= MJPEG_MAX_CLIENTS:
         raise HTTPException(status_code=503, detail="Too many video clients")
     host = request.client.host if request.client else "unknown"
     return StreamingResponse(
@@ -132,14 +132,14 @@ async def _stream_wsjpeg_impl(websocket: WebSocket) -> None:
         return
 
     runtime = _runtime_from_ws(websocket)
-    mjpeg_clients, ws_clients = runtime.get_client_counts()
-    if (mjpeg_clients + ws_clients) >= MJPEG_MAX_CLIENTS:
+    mjpeg_clients, video_ws_clients = runtime.get_video_client_counts()
+    if (mjpeg_clients + video_ws_clients) >= MJPEG_MAX_CLIENTS:
         await websocket.close(code=4403, reason="Too many video clients")
         return
 
     host = websocket.client.host if websocket.client else "unknown"
     await websocket.accept()
-    runtime.register_ws_client()
+    runtime.register_video_ws_client()
     LOGGER.info("WS JPEG stream opened from %s", host)
 
     requested_fps_raw = websocket.query_params.get("fps")
@@ -233,7 +233,7 @@ async def _stream_wsjpeg_impl(websocket: WebSocket) -> None:
     except Exception:
         LOGGER.exception("WS JPEG stream error for %s", host)
     finally:
-        runtime.unregister_ws_client()
+        runtime.unregister_video_ws_client()
         try:
             await websocket.close()
         except Exception:
@@ -243,11 +243,6 @@ async def _stream_wsjpeg_impl(websocket: WebSocket) -> None:
 
 @router.get("/api/media/mjpeg")
 async def stream_mjpeg_api(request: Request) -> StreamingResponse:
-    return await _stream_mjpeg_impl(request)
-
-
-@router.get("/stream.mjpeg")
-async def stream_mjpeg_legacy(request: Request) -> StreamingResponse:
     return await _stream_mjpeg_impl(request)
 
 

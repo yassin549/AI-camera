@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Tuple, TYPE_CHECKING
 
 import cv2
 import numpy as np
 
-from detector import FaceDetector
-from embedder import FaceEmbedder
-from utils import cosine_similarity
+from utils import cosine
+
+if TYPE_CHECKING:
+    from detector import FaceDetector
+    from embedder import FaceEmbedder
 
 __test__ = False
 
@@ -30,8 +32,8 @@ def _largest_face(boxes: List[Tuple[int, int, int, int]]) -> Tuple[int, int, int
 
 def encode_one_face(
     image_path: str,
-    detector: FaceDetector,
-    embedder: FaceEmbedder,
+    detector: "FaceDetector",
+    embedder: "FaceEmbedder",
 ) -> np.ndarray:
     img = cv2.imread(image_path)
     if img is None:
@@ -52,6 +54,9 @@ def encode_one_face(
 
 
 def main() -> None:
+    from detector import FaceDetector
+    from embedder import FaceEmbedder
+
     args = parse_args()
     detector = FaceDetector()
     embedder = FaceEmbedder(padding_ratio=args.padding_ratio)
@@ -61,7 +66,7 @@ def main() -> None:
     finally:
         detector.close()
 
-    sim = cosine_similarity(emb_a, emb_b)
+    sim = cosine(emb_a, emb_b)
     print(f"cosine_similarity={sim:.6f}")
     print(f"match@0.60={sim >= 0.60}")
     print(f"match@0.80={sim >= 0.80}")

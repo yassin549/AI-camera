@@ -7,6 +7,7 @@ export interface IdentityStats {
 
 export interface IdentitySummary {
   id: string;
+  name?: string;
   display_name?: string;
   first_seen: string;
   last_seen: string;
@@ -250,6 +251,7 @@ function normalizeIdentity(raw: unknown): IdentitySummary {
 
   return {
     id,
+    ...(displayName ? { name: displayName } : {}),
     ...(displayName ? { display_name: displayName } : {}),
     first_seen: firstSeen,
     last_seen: lastSeen,
@@ -404,6 +406,26 @@ export async function muteIdentity(id: string, muted?: boolean): Promise<{ ok: t
     method: "POST",
     body: JSON.stringify(muted === undefined ? {} : { muted })
   });
+}
+
+export async function assignTrackIdentity(
+  trackId: number,
+  identityId: string | number,
+  cacheSeconds?: number
+): Promise<{ ok: true; track_id: number; identity_id: number; cache_seconds: number }> {
+  const body: Record<string, unknown> = {
+    identity_id: Number(identityId)
+  };
+  if (typeof cacheSeconds === "number" && Number.isFinite(cacheSeconds)) {
+    body.cache_seconds = cacheSeconds;
+  }
+  return request<{ ok: true; track_id: number; identity_id: number; cache_seconds: number }>(
+    `/api/tracks/${encodeURIComponent(String(trackId))}/assign`,
+    {
+      method: "POST",
+      body: JSON.stringify(body)
+    }
+  );
 }
 
 export function resolveMetadataWsUrl(): string {

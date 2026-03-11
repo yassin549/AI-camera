@@ -62,8 +62,6 @@ Core files you will likely touch first:
 - `src/components/VideoCanvas.tsx`: transport fallback + overlay drawing.
 - `docker-compose.yml`: Janus gateway + optional FFmpeg relay.
 
-`api.py` exists but is a legacy minimal API path. The active runtime path is `main.py` + `api_server.py`.
-
 ## Prerequisites
 
 - Python 3.10+
@@ -181,6 +179,18 @@ Windows:
 scripts\ffmpeg-push.bat "rtsp://USER:PASS@CAMERA_IP:554/your-path"
 ```
 
+Optional low-latency re-encode (if camera GOP/B-frames cannot be tuned):
+Set the camera to H.264, short GOP (1-2s), and no B-frames when possible.
+
+```bash
+AICAM_FFMPEG_REENCODE=1 scripts/ffmpeg-push.sh "rtsp://USER:PASS@CAMERA_IP:554/your-path"
+```
+
+```powershell
+$env:AICAM_FFMPEG_REENCODE="1"
+scripts\ffmpeg-push.bat "rtsp://USER:PASS@CAMERA_IP:554/your-path"
+```
+
 Optional Docker-managed ingest (no local ffmpeg install):
 
 ```bash
@@ -227,7 +237,7 @@ python tools/check_janus_mountpoint.py
 
 - `API_KEY`: enables auth on identities/realtime/media/janus routes.
 - `CORS_ORIGINS`, `CORS_ORIGIN_REGEX`: browser access control.
-- `AICAM_ENABLE_FRAME_STREAMING`: enables backend WebRTC/MJPEG frame streaming.
+- `AICAM_ENABLE_FRAME_STREAMING`: enables backend WebRTC/MJPEG frame streaming (set to `0` for Janus-only production).
 - `AICAM_MJPEG_FPS`, `AICAM_MJPEG_QUALITY`, `AICAM_MJPEG_QUALITY_MIN`, `AICAM_MJPEG_MAX_CLIENTS`.
 - `AICAM_WSJPEG_ADAPTIVE`, `AICAM_WSJPEG_MIN_FPS`, `AICAM_WSJPEG_QUALITY_STEP`, `AICAM_WSJPEG_SLOW_SEND_MS`, `AICAM_WSJPEG_FAST_SEND_MS`.
 - `AICAM_CAPTURE_BUFFER`: capture queue size (low value reduces latency).
@@ -245,9 +255,13 @@ python tools/check_janus_mountpoint.py
 - `VITE_METADATA_LATEST_URL`
 - `VITE_METADATA_POLL_MS`
 - `VITE_JANUS_HTTP_URL`
+- `VITE_JANUS_WS_URL` (optional WebSocket signaling endpoint)
 - `VITE_JANUS_MOUNTPOINT`
+- `VITE_JANUS_FIRST_TRACK_TIMEOUT_MS`
 - `VITE_VIDEO_PRIMARY_TRANSPORT` (`janus`)
 - `VITE_VIDEO_FALLBACK_TRANSPORT` (`wsjpeg|none`)
+- `VITE_WSJPEG_FPS_LOCAL`, `VITE_WSJPEG_FPS_REMOTE`, `VITE_WSJPEG_ADAPTIVE`
+- `VITE_WSJPEG_RENDER_MAX_FPS` (`0` disables client-side throttle)
 - `VITE_DISABLE_JANUS`
 - `VITE_DISABLE_BACKEND_VIDEO`
 - `VITE_DISABLE_WEBRTC`
@@ -263,6 +277,7 @@ python tools/check_janus_mountpoint.py
 - `POST /api/identities/reindex`
 - `GET /api/realtime/latest`
 - `WS /api/realtime/ws`
+- `POST /api/tracks/{track_id}/assign`
 - `WS /api/media/ws`
 - `GET /api/media/mjpeg`
 - `GET|POST /janus/*` (reverse proxy)
@@ -310,7 +325,7 @@ Or reserved domain:
 ngrok http --domain=<your-name>.ngrok-free.app 8080
 ```
 
-Use the resulting public URL as `VITE_API_BASE` and expose Janus HTTP signaling separately for `VITE_JANUS_HTTP_URL`.
+Use the resulting public URL as `VITE_API_BASE`. If you use the backend `/janus` reverse proxy, reuse the same ngrok URL for `VITE_JANUS_HTTP_URL`.
 
 ### 3) Backend env (`.env.backend.local`)
 
@@ -328,11 +343,12 @@ In Vercel Project Settings -> Environment Variables (see `.env.vercel.example`):
 VITE_API_BASE=https://<your-backend-domain>
 VITE_API_KEY=<same-shared-secret-as-API_KEY>
 VITE_JANUS_HTTP_URL=https://<your-janus-domain>/janus
+VITE_JANUS_WS_URL=wss://<your-janus-domain>/janus
 VITE_DISABLE_JANUS=false
-VITE_DISABLE_BACKEND_VIDEO=false
+VITE_DISABLE_BACKEND_VIDEO=true
 VITE_DISABLE_WEBRTC=false
 VITE_VIDEO_PRIMARY_TRANSPORT=janus
-VITE_VIDEO_FALLBACK_TRANSPORT=wsjpeg
+VITE_VIDEO_FALLBACK_TRANSPORT=none
 ```
 
 Notes:

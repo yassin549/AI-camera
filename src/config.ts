@@ -28,6 +28,13 @@ function asBool(value: string | undefined): boolean {
   return normalized === "1" || normalized === "true" || normalized === "yes";
 }
 
+function asBoolWithDefault(value: string | undefined, fallback: boolean): boolean {
+  if (value === undefined) {
+    return fallback;
+  }
+  return asBool(value);
+}
+
 function trimTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
 }
@@ -38,6 +45,17 @@ function asPositiveInt(value: string | undefined, fallback: number): number {
   }
   const parsed = Number.parseInt(value, 10);
   if (!Number.isFinite(parsed) || parsed <= 0) {
+    return fallback;
+  }
+  return parsed;
+}
+
+function asNonNegativeInt(value: string | undefined, fallback: number): number {
+  if (!value) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(value, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
     return fallback;
   }
   return parsed;
@@ -82,8 +100,15 @@ const wsMetadata =
   readEnv("VITE_WS_METADATA_URL", "REACT_APP_WS_URL") ??
   `${normalizedRestBase}/api/realtime/ws`;
 const janusHttp =
-  readEnv("VITE_JANUS_HTTP_URL", "REACT_APP_JANUS_HTTP_URL") ??
+  readEnv(
+    "VITE_JANUS_HTTP_URL",
+    "VITE_JANUS_URL",
+    "REACT_APP_JANUS_HTTP_URL",
+    "REACT_APP_JANUS_URL"
+  ) ??
   `${normalizedRestBase}/janus`;
+const janusWsRaw = readEnv("VITE_JANUS_WS_URL", "REACT_APP_JANUS_WS_URL") ?? "";
+const janusWs = janusWsRaw ? trimTrailingSlash(janusWsRaw) : "";
 const janusMountpoint = Number(readEnv("VITE_JANUS_MOUNTPOINT", "REACT_APP_JANUS_MOUNTPOINT") ?? "1");
 const useMock = asBool(readEnv("VITE_USE_MOCK", "REACT_APP_USE_MOCK"));
 const apiKey = readEnv("VITE_API_KEY", "REACT_APP_API_KEY");
@@ -100,6 +125,26 @@ const metadataPollMs = asPositiveInt(
   readEnv("VITE_METADATA_POLL_MS", "REACT_APP_METADATA_POLL_MS"),
   250
 );
+const janusFirstTrackTimeoutMs = asPositiveInt(
+  readEnv("VITE_JANUS_FIRST_TRACK_TIMEOUT_MS", "REACT_APP_JANUS_FIRST_TRACK_TIMEOUT_MS"),
+  15000
+);
+const wsJpegFpsLocal = asPositiveInt(
+  readEnv("VITE_WSJPEG_FPS_LOCAL", "REACT_APP_WSJPEG_FPS_LOCAL"),
+  20
+);
+const wsJpegFpsRemote = asPositiveInt(
+  readEnv("VITE_WSJPEG_FPS_REMOTE", "REACT_APP_WSJPEG_FPS_REMOTE"),
+  10
+);
+const wsJpegAdaptive = asBoolWithDefault(
+  readEnv("VITE_WSJPEG_ADAPTIVE", "REACT_APP_WSJPEG_ADAPTIVE"),
+  true
+);
+const wsJpegRenderMaxFps = asNonNegativeInt(
+  readEnv("VITE_WSJPEG_RENDER_MAX_FPS", "REACT_APP_WSJPEG_RENDER_MAX_FPS"),
+  0
+);
 const videoPrimaryTransport = normalizePrimaryTransport(
   readEnv("VITE_VIDEO_PRIMARY_TRANSPORT", "REACT_APP_VIDEO_PRIMARY_TRANSPORT"),
   "janus"
@@ -114,6 +159,7 @@ export const API = {
   REST_BASE: normalizedRestBase,
   WS_METADATA: wsMetadata,
   JANUS_HTTP: janusHttp,
+  JANUS_WS: janusWs,
   JANUS_MOUNTPOINT: Number.isFinite(janusMountpoint) && janusMountpoint > 0 ? janusMountpoint : 1,
   DISABLE_JANUS: disableJanus,
   DISABLE_BACKEND_VIDEO: disableBackendVideo,
@@ -122,6 +168,11 @@ export const API = {
   VIDEO_TRANSPORT_PLAN: videoTransportPlan,
   METADATA_LATEST: metadataLatest,
   METADATA_POLL_MS: metadataPollMs,
+  JANUS_FIRST_TRACK_TIMEOUT_MS: janusFirstTrackTimeoutMs,
+  WSJPEG_FPS_LOCAL: wsJpegFpsLocal,
+  WSJPEG_FPS_REMOTE: wsJpegFpsRemote,
+  WSJPEG_ADAPTIVE: wsJpegAdaptive,
+  WSJPEG_RENDER_MAX_FPS: wsJpegRenderMaxFps,
   USE_MOCK: useMock || false,
   API_KEY: apiKey
 };

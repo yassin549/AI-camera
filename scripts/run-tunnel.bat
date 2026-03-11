@@ -1,12 +1,15 @@
 @echo off
 setlocal
 
-set "CF_CONFIG=%~dp0..\cloudflared\config.yml"
-if not exist "%CF_CONFIG%" (
-  echo [ERROR] Missing cloudflared config file: "%CF_CONFIG%"
-  echo Copy cloudflared\config.yml.example to cloudflared\config.yml and fill tunnel values first.
+set "PORT=%~1"
+if "%PORT%"=="" set "PORT=8080"
+
+where ngrok >nul 2>&1
+if errorlevel 1 (
+  echo [ERROR] ngrok is not installed or not on PATH.
+  echo Install ngrok and run: ngrok config add-authtoken ^<YOUR_NGROK_TOKEN^>
   exit /b 1
 )
 
-cloudflared tunnel --config "%CF_CONFIG%" run
-
+echo [INFO] Starting ngrok HTTP tunnel on port %PORT%
+ngrok http %PORT%

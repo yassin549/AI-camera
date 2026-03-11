@@ -111,16 +111,16 @@ async def _ws_metadata_impl(websocket: WebSocket) -> None:
         return
 
     runtime = _runtime_from_websocket(websocket)
-    _, ws_clients = runtime.get_client_counts()
-    if ws_clients >= WS_MAX_CLIENTS:
+    metadata_ws_clients = runtime.get_metadata_ws_client_count()
+    if metadata_ws_clients >= WS_MAX_CLIENTS:
         await websocket.close(code=4403, reason="Too many WS clients")
         return
 
     await websocket.accept()
-    runtime.register_ws_client()
+    runtime.register_metadata_ws_client()
     client = websocket.client.host if websocket.client else "unknown"
     LOGGER.info("WS metadata connected from %s", client)
-    last_version = 0
+    queue = runtime.metadata_hub.subscribe()
     next_heartbeat_at = time.monotonic() + WS_HEARTBEAT_SEC
 
     await websocket.send_json({"type": "connected", "server_time": _utc_now_iso()})
@@ -129,14 +129,17 @@ async def _ws_metadata_impl(websocket: WebSocket) -> None:
         while True:
             now = time.monotonic()
             wait_timeout = max(0.001, min(0.2, next_heartbeat_at - now))
-            version, payload, _ = await asyncio.to_thread(
-                runtime.metadata_hub.wait_for_update,
-                last_version,
-                wait_timeout,
-            )
-            if payload is not None and version > last_version:
-                await websocket.send_json(payload)
-                last_version = version
+            payload = None
+            try:
+                payload = await asyncio.wait_for(queue.get(), timeout=wait_timeout)
+            except asyncio.TimeoutError:
+                payload = None
+
+            if payload is not None:
+                if isinstance(payload, str):
+                    await websocket.send_text(payload)
+                else:
+                    await websocket.send_json(payload)
                 next_heartbeat_at = time.monotonic() + WS_HEARTBEAT_SEC
             elif time.monotonic() >= next_heartbeat_at:
                 await websocket.send_json(
@@ -161,7 +164,11 @@ async def _ws_metadata_impl(websocket: WebSocket) -> None:
     except Exception:
         LOGGER.exception("WS metadata error for %s", client)
     finally:
-        runtime.unregister_ws_client()
+        runtime.unregister_metadata_ws_client()
+        try:
+            runtime.metadata_hub.unsubscribe(queue)
+        except Exception:
+            pass
         try:
             await websocket.close()
         except Exception:
@@ -170,11 +177,6 @@ async def _ws_metadata_impl(websocket: WebSocket) -> None:
 
 @router.websocket("/api/realtime/ws")
 async def ws_metadata_api(websocket: WebSocket) -> None:
-    await _ws_metadata_impl(websocket)
-
-
-@router.websocket("/ws/metadata")
-async def ws_metadata_legacy(websocket: WebSocket) -> None:
     await _ws_metadata_impl(websocket)
 
 
@@ -187,7 +189,7 @@ async def webrtc_offer(request: Request) -> JSONResponse:
     if not AIORTC_AVAILABLE:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="WebRTC disabled (aiortc unavailable). Use /stream.mjpeg fallback.",
+            detail="WebRTC disabled (aiortc unavailable). Use /api/media/mjpeg fallback.",
         )
 
     raw_body = await request.body()

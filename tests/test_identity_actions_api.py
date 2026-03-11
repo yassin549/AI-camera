@@ -191,3 +191,41 @@ def test_delete_endpoint_clears_live_track_and_index(tmp_path: Path) -> None:
         assert db.identity_exists(int(identity_id)) is False
     finally:
         runtime.close()
+
+
+def test_manual_track_assignment_endpoint_links_unresolved_track(tmp_path: Path) -> None:
+    runtime, _frame_store, track_store, _db_path = _setup_runtime(tmp_path)
+    try:
+        identity_id = db.add_identity(
+            face_emb=np.ones((128,), dtype=np.float32),
+            body_emb=None,
+            face_sample_path=None,
+            body_sample_path=None,
+            ts=db.now_iso(),
+        )
+        track_store.update_from_tracker(
+            [Track(track_id=31, bbox=(20, 20, 90, 150), score=0.92, feature=None)],
+            frame_id=3,
+            max_tracks=20,
+            max_age_frames=24,
+        )
+
+        app = create_app(runtime)
+        with TestClient(app) as client:
+            response = client.post(
+                "/api/tracks/31/assign",
+                json={"identity_id": int(identity_id), "cache_seconds": 45},
+            )
+            assert response.status_code == 200
+            payload = response.json()
+            assert payload["ok"] is True
+            assert int(payload["track_id"]) == 31
+            assert int(payload["identity_id"]) == int(identity_id)
+
+        states = track_store.snapshot()
+        track_state = next((state for state in states if int(state.track_id) == 31), None)
+        assert track_state is not None
+        assert int(track_state.identity_id or -1) == int(identity_id)
+        assert str(track_state.modality) == "manual"
+    finally:
+        runtime.close()

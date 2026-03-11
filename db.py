@@ -554,16 +554,9 @@ class IdentityStore:
             if self.face_matrix.shape[0] == 0:
                 return None, -1.0
             sims = self.face_matrix @ query
-            best_id: Optional[int] = None
-            best_score = -1.0
-            for idx, ident_id in enumerate(self.face_ids):
-                row = self._row_cache.get(int(ident_id))
-                if row is not None and bool(row.get("is_muted", False)):
-                    continue
-                score = float(sims[idx])
-                if score > best_score:
-                    best_score = score
-                    best_id = int(ident_id)
+            best_idx = int(np.argmax(sims))
+            best_score = float(sims[best_idx])
+            best_id = int(self.face_ids[best_idx])
             return best_id, best_score
 
     def find_best_body(self, body_emb: np.ndarray) -> Tuple[Optional[int], float]:
@@ -572,16 +565,9 @@ class IdentityStore:
             if self.body_matrix.shape[0] == 0:
                 return None, -1.0
             sims = self.body_matrix @ query
-            best_id: Optional[int] = None
-            best_score = -1.0
-            for idx, ident_id in enumerate(self.body_ids):
-                row = self._row_cache.get(int(ident_id))
-                if row is not None and bool(row.get("is_muted", False)):
-                    continue
-                score = float(sims[idx])
-                if score > best_score:
-                    best_score = score
-                    best_id = int(ident_id)
+            best_idx = int(np.argmax(sims))
+            best_score = float(sims[best_idx])
+            best_id = int(self.body_ids[best_idx])
             return best_id, best_score
 
     def list_identities(self) -> List[Dict[str, object]]:

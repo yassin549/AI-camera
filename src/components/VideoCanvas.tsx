@@ -27,6 +27,19 @@ interface VideoCanvasProps {
 
 type TransportMode = "connecting" | "janus" | "wsjpeg" | "error";
 type TransportCandidate = "janus" | "wsjpeg";
+type JanusStep = "create" | "attach" | "watch" | "offer" | "answer" | "first-track";
+
+class JanusStepError extends Error {
+  step: JanusStep;
+  code: string;
+
+  constructor(step: JanusStep, code: string, message: string) {
+    super(message);
+    this.name = "JanusStepError";
+    this.step = step;
+    this.code = code;
+  }
+}
 
 interface ProjectedTrack {
   track: TrackPayload;
@@ -100,7 +113,7 @@ function resolveApiUrl(pathOrUrl: string): string {
   if (!pathOrUrl) {
     return pathOrUrl;
   }
-  if (/^(https?:)?\/\//i.test(pathOrUrl) || pathOrUrl.startsWith("blob:") || pathOrUrl.startsWith("data:")) {
+  if (/^(https?|wss?):\/\//i.test(pathOrUrl) || pathOrUrl.startsWith("blob:") || pathOrUrl.startsWith("data:")) {
     return pathOrUrl;
   }
   if (!API.REST_BASE) {
@@ -134,6 +147,27 @@ function isNgrokFreeUrl(input: string): boolean {
     return host.endsWith(".ngrok-free.app") || host.endsWith(".ngrok-free.dev");
   } catch {
     return false;
+  }
+}
+
+function appendNgrokSkipParam(input: string): string {
+  if (!input || !isNgrokFreeUrl(input)) {
+    return input;
+  }
+  try {
+    const parsed = new URL(input, window.location.href);
+    if (!parsed.searchParams.has("ngrok-skip-browser-warning")) {
+      parsed.searchParams.set("ngrok-skip-browser-warning", "1");
+    }
+    return parsed.toString();
+  } catch {
+    const [base, hash = ""] = input.split("#", 2);
+    if (base.includes("ngrok-skip-browser-warning=")) {
+      return input;
+    }
+    const separator = base.includes("?") ? "&" : "?";
+    const next = `${base}${separator}ngrok-skip-browser-warning=1`;
+    return hash ? `${next}#${hash}` : next;
   }
 }
 
@@ -203,22 +237,53 @@ export function VideoCanvas({
     [metadataLatestUrl]
   );
   const resolvedJanusHttpUrl = useMemo(() => resolveApiUrl(janusHttpUrl).replace(/\/+$/, ""), [janusHttpUrl]);
+  const resolvedJanusWsUrl = useMemo(() => {
+    if (!API.JANUS_WS) {
+      return "";
+    }
+    return appendNgrokSkipParam(toWebSocketUrl(resolveApiUrl(API.JANUS_WS)));
+  }, []);
   const resolvedWsJpegUrl = useMemo(() => {
     const base = toWebSocketUrl(resolveApiUrl("/api/media/ws"));
-    const remoteFps = isNgrokFreeUrl(API.REST_BASE) ? 10 : 20;
+    const remoteFps = isNgrokFreeUrl(API.REST_BASE) ? API.WSJPEG_FPS_REMOTE : API.WSJPEG_FPS_LOCAL;
+    const adaptive = API.WSJPEG_ADAPTIVE ? "1" : "0";
     const separator = base.includes("?") ? "&" : "?";
-    return withApiKeyQuery(`${base}${separator}fps=${remoteFps}`);
+    return withApiKeyQuery(`${base}${separator}fps=${remoteFps}&adaptive=${adaptive}`);
   }, []);
   const resolvedJanusMountpoint = useMemo(
     () => (Number.isFinite(janusMountpoint) && Number(janusMountpoint) > 0 ? Number(janusMountpoint) : 1),
     [janusMountpoint]
   );
-  const configuredTransportPlan = API.VIDEO_TRANSPORT_PLAN as readonly TransportCandidate[];
-  const configuredTransportPlanLabel = useMemo(
-    () => (configuredTransportPlan.length ? configuredTransportPlan.map((item) => transportLabel(item)).join(" -> ") : "NONE"),
-    [configuredTransportPlan]
+  const janusFirstTrackTimeoutMs = useMemo(
+    () =>
+      Math.max(
+        1000,
+        Number.isFinite(API.JANUS_FIRST_TRACK_TIMEOUT_MS) ? Number(API.JANUS_FIRST_TRACK_TIMEOUT_MS) : 15000
+      ),
+    []
   );
+  const wsJpegRenderMinIntervalMs = useMemo(() => {
+    const maxFps = Number.isFinite(API.WSJPEG_RENDER_MAX_FPS) ? Number(API.WSJPEG_RENDER_MAX_FPS) : 0;
+    if (maxFps <= 0) {
+      return 0;
+    }
+    return Math.max(0, 1000 / maxFps);
+  }, []);
+  const configuredTransportPlan = API.VIDEO_TRANSPORT_PLAN as readonly TransportCandidate[];
   const authHeaders = useMemo(() => withApiKeyHeaders(), []);
+  const effectiveTransportPlan = useMemo(() => {
+    if (!configuredTransportPlan.length) {
+      return [] as TransportCandidate[];
+    }
+    if (!disableBackendVideo) {
+      return configuredTransportPlan as TransportCandidate[];
+    }
+    return configuredTransportPlan.filter((candidate) => candidate !== "wsjpeg") as TransportCandidate[];
+  }, [configuredTransportPlan, disableBackendVideo]);
+  const configuredTransportPlanLabel = useMemo(
+    () => (effectiveTransportPlan.length ? effectiveTransportPlan.map((item) => transportLabel(item)).join(" -> ") : "NONE"),
+    [effectiveTransportPlan]
+  );
   const disableWebRtc = (import.meta.env.VITE_DISABLE_WEBRTC as string | undefined) === "true";
   const containerRef = useRef<HTMLDivElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
@@ -241,8 +306,11 @@ export function VideoCanvas({
   const lastOverlayDrawAtRef = useRef<number | null>(null);
   const janusConnectStartedAtRef = useRef<number | null>(null);
   const janusTtffMsRef = useRef<number | null>(null);
+  const janusDiagnosticsRef = useRef<string[]>([]);
   const perfPostInflightRef = useRef(false);
   const janusPcRef = useRef<RTCPeerConnection | null>(null);
+  const janusWsRef = useRef<WebSocket | null>(null);
+  const janusTransportRef = useRef<"http" | "ws" | null>(null);
   const wsJpegSocketRef = useRef<WebSocket | null>(null);
   const wsJpegObjectUrlRef = useRef<string | null>(null);
   const janusAbortRef = useRef<AbortController | null>(null);
@@ -327,6 +395,17 @@ export function VideoCanvas({
       janusPc.close();
       janusPcRef.current = null;
     }
+    const janusWs = janusWsRef.current;
+    if (janusWs) {
+      try {
+        janusWs.onopen = null;
+        janusWs.onmessage = null;
+        janusWs.onerror = null;
+        janusWs.onclose = null;
+      } catch {
+        // Ignore WS handler cleanup errors.
+      }
+    }
     const wsJpegSocket = wsJpegSocketRef.current;
     if (wsJpegSocket) {
       try {
@@ -363,22 +442,49 @@ export function VideoCanvas({
     }
 
     const sessionId = janusSessionRef.current;
+    const transport = janusTransportRef.current;
     janusSessionRef.current = null;
     janusHandleRef.current = null;
+    janusTransportRef.current = null;
     if (!sessionId) {
+      if (janusWs) {
+        try {
+          janusWs.close();
+        } catch {
+          // Ignore WS close errors.
+        }
+        janusWsRef.current = null;
+      }
       return;
     }
-    const payload = {
-      janus: "destroy",
-      transaction: nextTx(),
-    };
-    const destroyHeaders = withApiKeyHeaders();
-    destroyHeaders.set("Content-Type", "application/json");
-    void fetch(`${resolvedJanusHttpUrl}/${sessionId}`, {
-      method: "POST",
-      headers: destroyHeaders,
-      body: JSON.stringify(payload),
-    }).catch(() => undefined);
+
+    if (transport === "ws" && janusWs && janusWs.readyState === WebSocket.OPEN) {
+      try {
+        janusWs.send(JSON.stringify({ janus: "destroy", session_id: sessionId, transaction: nextTx() }));
+      } catch {
+        // Ignore destroy failures; session will expire server-side.
+      }
+    } else if (resolvedJanusHttpUrl) {
+      const payload = {
+        janus: "destroy",
+        transaction: nextTx(),
+      };
+      const destroyHeaders = withApiKeyHeaders();
+      destroyHeaders.set("Content-Type", "application/json");
+      void fetch(`${resolvedJanusHttpUrl}/${sessionId}`, {
+        method: "POST",
+        headers: destroyHeaders,
+        body: JSON.stringify(payload),
+      }).catch(() => undefined);
+    }
+    if (janusWs) {
+      try {
+        janusWs.close();
+      } catch {
+        // Ignore WS close errors.
+      }
+      janusWsRef.current = null;
+    }
   };
 
   useEffect(() => {
@@ -415,82 +521,219 @@ export function VideoCanvas({
       mjpeg.src = url;
     };
 
+    const normalizeCodeToken = (input: unknown): string => {
+      const token = String(input ?? "unknown")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "");
+      return token || "unknown";
+    };
+
+    const normalizeSnippet = (raw: string): string => {
+      if (!raw) {
+        return "";
+      }
+      return raw.replace(/\s+/g, " ").trim().slice(0, 180);
+    };
+
+    const classifyHttpStatus = (status: number): string => {
+      if (status === 401 || status === 403) {
+        return "proxy_auth_failed";
+      }
+      if (status === 404) {
+        return "proxy_path_not_found";
+      }
+      if (status === 502 || status === 503 || status === 504) {
+        return "proxy_upstream_unavailable";
+      }
+      return `http_${status}`;
+    };
+
+    const pushJanusDiagnostic = (step: JanusStep, code: string, detail: string, ok: boolean) => {
+      const entry = `[janus:${step}] ${code}${detail ? ` | ${detail}` : ""}`;
+      const history = janusDiagnosticsRef.current;
+      history.push(entry);
+      if (history.length > 40) {
+        history.splice(0, history.length - 40);
+      }
+      if (ok) {
+        console.info(entry);
+      } else {
+        console.error(entry);
+      }
+    };
+
+    const parseJanusPayload = async (response: Response, step: JanusStep): Promise<Record<string, unknown>> => {
+      const raw = await response.text();
+      const trimmed = raw.trim();
+      if (!trimmed) {
+        throw new JanusStepError(step, `${step}_empty_response`, "Janus returned an empty response body");
+      }
+      let payloadAny: unknown;
+      try {
+        payloadAny = JSON.parse(trimmed) as unknown;
+      } catch {
+        throw new JanusStepError(
+          step,
+          `${step}_non_json_response`,
+          `Expected Janus JSON but received: ${normalizeSnippet(trimmed)}`
+        );
+      }
+      if (!payloadAny || typeof payloadAny !== "object" || Array.isArray(payloadAny)) {
+        throw new JanusStepError(step, `${step}_invalid_payload`, "Janus payload has invalid shape");
+      }
+      return payloadAny as Record<string, unknown>;
+    };
+
     const janusPost = async (
       path: string,
       body: Record<string, unknown>,
-      signal: AbortSignal
+      signal: AbortSignal,
+      step: JanusStep
     ): Promise<Record<string, unknown>> => {
-      const headers = withApiKeyHeaders();
+      const headers = new Headers();
       headers.set("Content-Type", "application/json");
-      const response = await fetch(`${resolvedJanusHttpUrl}${path}`, {
-        method: "POST",
-        headers,
-        body: JSON.stringify({ ...body, transaction: nextTx() }),
-        signal,
-      });
-      if (!response.ok) {
-        throw new Error(`Janus HTTP ${response.status}`);
+      let response: Response;
+      try {
+        response = await fetch(withApiKeyQuery(`${resolvedJanusHttpUrl}${path}`), {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ ...body, transaction: nextTx() }),
+          signal,
+        });
+      } catch (err: unknown) {
+        const reason = err instanceof Error ? err.message : "request failed";
+        throw new JanusStepError(step, `${step}_network_unreachable`, reason);
       }
-      const payload = (await response.json()) as Record<string, unknown>;
+      if (!response.ok) {
+        const raw = await response.text().catch(() => "");
+        const snippet = normalizeSnippet(raw);
+        const detail = snippet ? `HTTP ${response.status} ${snippet}` : `HTTP ${response.status}`;
+        throw new JanusStepError(step, `${step}_${classifyHttpStatus(response.status)}`, detail);
+      }
+      const payload = await parseJanusPayload(response, step);
       if (payload.janus === "error") {
         const error = payload.error as { code?: number; reason?: string } | undefined;
-        const reason = error?.reason ?? `code ${error?.code ?? "unknown"}`;
-        throw new Error(`Janus error: ${reason}`);
+        const apiCode = normalizeCodeToken(error?.code ?? "unknown");
+        const reason = normalizeSnippet(error?.reason ?? "");
+        throw new JanusStepError(
+          step,
+          `${step}_janus_error_${apiCode}`,
+          reason || `Janus reported error code ${error?.code ?? "unknown"}`
+        );
       }
       return payload;
     };
 
-    const startJanusTransport = async (): Promise<{ ok: boolean; error: string }> => {
+    const startJanusTransportHttp = async (): Promise<{ ok: boolean; error: string }> => {
       janusConnectStartedAtRef.current = performance.now();
       janusTtffMsRef.current = null;
+      janusDiagnosticsRef.current = [];
+      janusTransportRef.current = "http";
       if (!resolvedJanusHttpUrl || typeof RTCPeerConnection === "undefined") {
-        return { ok: false, error: "Janus endpoint or browser WebRTC unavailable" };
+        return { ok: false, error: "janus_unavailable: Janus endpoint or browser WebRTC unavailable" };
       }
       const abort = new AbortController();
       const signal = abort.signal;
       janusAbortRef.current = abort;
       let sessionId: number | null = null;
       let handleId: number | null = null;
+      let sawOffer = false;
+      let sentAnswer = false;
+      let resolvedFirstTrack = false;
+      let firstTrackResolve: ((value: boolean) => void) | null = null;
+      let firstTrackTimeout: number | null = null;
+      let firstTrackFailure: JanusStepError | null = null;
+      const settleFirstTrack = (value: boolean) => {
+        if (resolvedFirstTrack) {
+          return;
+        }
+        resolvedFirstTrack = true;
+        if (firstTrackTimeout !== null) {
+          window.clearTimeout(firstTrackTimeout);
+          firstTrackTimeout = null;
+        }
+        if (firstTrackResolve) {
+          firstTrackResolve(value);
+          firstTrackResolve = null;
+        }
+      };
+
       try {
-        const created = await janusPost("", { janus: "create" }, signal);
+        const created = await janusPost("", { janus: "create" }, signal, "create");
         sessionId = Number((created.data as { id?: number } | undefined)?.id ?? -1);
         if (!Number.isFinite(sessionId) || sessionId <= 0) {
-          throw new Error("Janus create session failed");
+          throw new JanusStepError("create", "create_invalid_session_id", "Janus create response missing valid session id");
         }
+        pushJanusDiagnostic("create", "ok", `session_id=${sessionId}`, true);
 
         const attached = await janusPost(
           `/${sessionId}`,
           { janus: "attach", plugin: "janus.plugin.streaming" },
-          signal
+          signal,
+          "attach"
         );
         handleId = Number((attached.data as { id?: number } | undefined)?.id ?? -1);
         if (!Number.isFinite(handleId) || handleId <= 0) {
-          throw new Error("Janus attach plugin failed");
+          throw new JanusStepError("attach", "attach_invalid_handle_id", "Janus attach response missing valid handle id");
         }
+        pushJanusDiagnostic("attach", "ok", `handle_id=${handleId}`, true);
 
         janusSessionRef.current = sessionId;
         janusHandleRef.current = handleId;
         const pc = new RTCPeerConnection();
         janusPcRef.current = pc;
+
         const firstTrack = new Promise<boolean>((resolve) => {
-          const timeout = window.setTimeout(() => resolve(false), 8000);
+          firstTrackResolve = resolve;
+          firstTrackTimeout = window.setTimeout(() => {
+            if (!sawOffer) {
+              firstTrackFailure = new JanusStepError(
+                "offer",
+                "offer_not_received",
+                `No Janus SDP offer received within ${Math.round(janusFirstTrackTimeoutMs)}ms`
+              );
+            } else if (sentAnswer) {
+              firstTrackFailure = new JanusStepError(
+                "first-track",
+                "signal_ok_media_failed",
+                `Signaling completed but no media track received within ${Math.round(janusFirstTrackTimeoutMs)}ms`
+              );
+            } else {
+              firstTrackFailure = new JanusStepError(
+                "answer",
+                "answer_not_completed",
+                `Offer received but local answer was not completed within ${Math.round(janusFirstTrackTimeoutMs)}ms`
+              );
+            }
+            pushJanusDiagnostic(
+              firstTrackFailure.step,
+              firstTrackFailure.code,
+              firstTrackFailure.message,
+              false
+            );
+            settleFirstTrack(false);
+          }, janusFirstTrackTimeoutMs);
+
           pc.ontrack = (event) => {
             if (!event.streams[0]) {
               return;
             }
-            window.clearTimeout(timeout);
+            settleFirstTrack(true);
             showVideo();
             video.srcObject = event.streams[0];
             video.play().catch(() => undefined);
             if (janusTtffMsRef.current === null && janusConnectStartedAtRef.current !== null) {
               janusTtffMsRef.current = Math.max(0, performance.now() - janusConnectStartedAtRef.current);
             }
+            pushJanusDiagnostic("first-track", "ok", "Remote media track received", true);
             transportModeRef.current = "janus";
             setTransportMode("janus");
             setTransportError(null);
-            resolve(true);
           };
         });
+
         pc.onicecandidate = (event) => {
           const sid = janusSessionRef.current;
           const hid = janusHandleRef.current;
@@ -503,15 +746,18 @@ export function VideoCanvas({
               janus: "trickle",
               candidate: event.candidate ?? { completed: true },
             },
-            signal
+            signal,
+            "answer"
           ).catch(() => undefined);
         };
 
         await janusPost(
           `/${sessionId}/${handleId}`,
           { janus: "message", body: { request: "watch", id: resolvedJanusMountpoint } },
-          signal
+          signal,
+          "watch"
         );
+        pushJanusDiagnostic("watch", "ok", `mountpoint=${resolvedJanusMountpoint}`, true);
 
         janusKeepaliveRef.current = window.setInterval(() => {
           if (signal.aborted || !janusSessionRef.current) {
@@ -520,21 +766,31 @@ export function VideoCanvas({
           void janusPost(
             `/${janusSessionRef.current}`,
             { janus: "keepalive" },
-            signal
+            signal,
+            "watch"
           ).catch(() => undefined);
         }, 25000);
 
         const pollEvents = async () => {
           while (!signal.aborted && janusSessionRef.current && janusHandleRef.current) {
             const rid = Date.now();
-            const response = await fetch(
-              `${resolvedJanusHttpUrl}/${janusSessionRef.current}?rid=${rid}&maxev=10`,
-              { signal, headers: authHeaders }
-            );
-            if (!response.ok) {
-              throw new Error(`Janus poll ${response.status}`);
+            let response: Response;
+            try {
+              response = await fetch(
+                withApiKeyQuery(`${resolvedJanusHttpUrl}/${janusSessionRef.current}?rid=${rid}&maxev=10`),
+                { signal }
+              );
+            } catch (err: unknown) {
+              const reason = err instanceof Error ? err.message : "poll request failed";
+              throw new JanusStepError("offer", "offer_poll_network_unreachable", reason);
             }
-            const event = (await response.json()) as Record<string, unknown>;
+            if (!response.ok) {
+              const raw = await response.text().catch(() => "");
+              const snippet = normalizeSnippet(raw);
+              const detail = snippet ? `HTTP ${response.status} ${snippet}` : `HTTP ${response.status}`;
+              throw new JanusStepError("offer", `offer_${classifyHttpStatus(response.status)}`, detail);
+            }
+            const event = await parseJanusPayload(response, "offer");
             const eventSender = Number(event.sender ?? -1);
 
             if (
@@ -544,10 +800,24 @@ export function VideoCanvas({
               typeof event.jsep === "object" &&
               janusPcRef.current
             ) {
+              if (!sawOffer) {
+                sawOffer = true;
+                pushJanusDiagnostic("offer", "ok", "Received remote SDP offer", true);
+              }
               const remote = event.jsep as RTCSessionDescriptionInit;
-              await janusPcRef.current.setRemoteDescription(remote);
-              const answer = await janusPcRef.current.createAnswer();
-              await janusPcRef.current.setLocalDescription(answer);
+              try {
+                await janusPcRef.current.setRemoteDescription(remote);
+              } catch (err: unknown) {
+                const reason = err instanceof Error ? err.message : "setRemoteDescription failed";
+                throw new JanusStepError("offer", "offer_set_remote_failed", reason);
+              }
+              try {
+                const answer = await janusPcRef.current.createAnswer();
+                await janusPcRef.current.setLocalDescription(answer);
+              } catch (err: unknown) {
+                const reason = err instanceof Error ? err.message : "create/set local answer failed";
+                throw new JanusStepError("answer", "answer_local_description_failed", reason);
+              }
               await janusPost(
                 `/${janusSessionRef.current}/${janusHandleRef.current}`,
                 {
@@ -555,8 +825,13 @@ export function VideoCanvas({
                   body: { request: "start" },
                   jsep: janusPcRef.current.localDescription,
                 },
-                signal
+                signal,
+                "answer"
               );
+              if (!sentAnswer) {
+                sentAnswer = true;
+                pushJanusDiagnostic("answer", "ok", "Submitted local SDP answer to Janus", true);
+              }
             }
 
             if (
@@ -579,26 +854,414 @@ export function VideoCanvas({
           if (signal.aborted || cancelled) {
             return;
           }
-          const message = err instanceof Error ? err.message : "Janus polling failed";
-          setTransportError(`Janus stream error: ${message}`);
-          transportModeRef.current = "error";
-          setTransportMode("error");
-          closeTransport();
+          if (err instanceof JanusStepError) {
+            firstTrackFailure = err;
+            pushJanusDiagnostic(err.step, err.code, err.message, false);
+          } else {
+            const message = err instanceof Error ? err.message : "Janus polling failed";
+            firstTrackFailure = new JanusStepError("offer", "offer_poll_failed", message);
+            pushJanusDiagnostic("offer", "offer_poll_failed", message, false);
+          }
+          settleFirstTrack(false);
         });
 
         const gotTrack = await firstTrack;
         if (!gotTrack) {
-          throw new Error("Janus connected but no media track received");
+          if (firstTrackFailure) {
+            throw firstTrackFailure;
+          }
+          throw new JanusStepError(
+            "first-track",
+            "first_track_timeout",
+            `No media track received within ${Math.round(janusFirstTrackTimeoutMs)}ms`
+          );
         }
         return { ok: true, error: "" };
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : "Janus negotiation failed";
+        const normalizedError =
+          err instanceof JanusStepError
+            ? err
+            : new JanusStepError(
+                "first-track",
+                "janus_negotiation_failed",
+                err instanceof Error ? err.message : "Janus negotiation failed"
+              );
+        if (!(err instanceof JanusStepError)) {
+          pushJanusDiagnostic(normalizedError.step, normalizedError.code, normalizedError.message, false);
+        }
         if (sessionId && !signal.aborted) {
-          void janusPost(`/${sessionId}`, { janus: "destroy" }, signal).catch(() => undefined);
+          void janusPost(`/${sessionId}`, { janus: "destroy" }, signal, "create").catch(() => undefined);
         }
         closeTransport();
-        return { ok: false, error: message };
+        return {
+          ok: false,
+          error: `${normalizedError.code} [${normalizedError.step}] ${normalizedError.message}`,
+        };
       }
+    };
+
+    const startJanusTransportWs = async (): Promise<{ ok: boolean; error: string }> => {
+      janusConnectStartedAtRef.current = performance.now();
+      janusTtffMsRef.current = null;
+      janusDiagnosticsRef.current = [];
+      if (!resolvedJanusWsUrl || typeof RTCPeerConnection === "undefined") {
+        return { ok: false, error: "janus_ws_unavailable: Janus WS endpoint or browser WebRTC unavailable" };
+      }
+
+      const abort = new AbortController();
+      const signal = abort.signal;
+      janusAbortRef.current = abort;
+      let sessionId: number | null = null;
+      let handleId: number | null = null;
+      let sawOffer = false;
+      let sentAnswer = false;
+      let resolvedFirstTrack = false;
+      let firstTrackResolve: ((value: boolean) => void) | null = null;
+      let firstTrackTimeout: number | null = null;
+      let firstTrackFailure: JanusStepError | null = null;
+      const settleFirstTrack = (value: boolean) => {
+        if (resolvedFirstTrack) {
+          return;
+        }
+        resolvedFirstTrack = true;
+        if (firstTrackTimeout !== null) {
+          window.clearTimeout(firstTrackTimeout);
+          firstTrackTimeout = null;
+        }
+        if (firstTrackResolve) {
+          firstTrackResolve(value);
+          firstTrackResolve = null;
+        }
+      };
+
+      const pending = new Map<
+        string,
+        {
+          resolve: (payload: Record<string, unknown>) => void;
+          reject: (error: JanusStepError) => void;
+          timer: number;
+          step: JanusStep;
+        }
+      >();
+
+      const closePending = (error: JanusStepError) => {
+        for (const [_, entry] of pending.entries()) {
+          window.clearTimeout(entry.timer);
+          entry.reject(error);
+        }
+        pending.clear();
+      };
+
+      const sendWs = (payload: Record<string, unknown>, step: JanusStep, timeoutMs = 8000) => {
+        return new Promise<Record<string, unknown>>((resolve, reject) => {
+          if (signal.aborted) {
+            reject(new JanusStepError(step, `${step}_aborted`, "Janus WS request aborted"));
+            return;
+          }
+          const ws = janusWsRef.current;
+          if (!ws || ws.readyState !== WebSocket.OPEN) {
+            reject(new JanusStepError(step, `${step}_ws_unavailable`, "Janus WebSocket not connected"));
+            return;
+          }
+          const tx = nextTx();
+          const timer = window.setTimeout(() => {
+            pending.delete(tx);
+            reject(new JanusStepError(step, `${step}_timeout`, "Janus WS response timed out"));
+          }, timeoutMs);
+          pending.set(tx, { resolve, reject, timer, step });
+          try {
+            ws.send(JSON.stringify({ ...payload, transaction: tx }));
+          } catch (err: unknown) {
+            window.clearTimeout(timer);
+            pending.delete(tx);
+            const reason = err instanceof Error ? err.message : "Janus WS send failed";
+            reject(new JanusStepError(step, `${step}_ws_send_failed`, reason));
+          }
+        });
+      };
+
+      try {
+        const ws = new WebSocket(resolvedJanusWsUrl);
+        janusWsRef.current = ws;
+        janusTransportRef.current = "ws";
+
+        const opened = await new Promise<boolean>((resolve) => {
+          const timeout = window.setTimeout(() => resolve(false), 6000);
+          ws.onopen = () => {
+            window.clearTimeout(timeout);
+            resolve(true);
+          };
+          ws.onerror = () => {
+            window.clearTimeout(timeout);
+            resolve(false);
+          };
+        });
+        if (!opened || signal.aborted) {
+          throw new JanusStepError("create", "ws_connect_failed", "Failed to open Janus WebSocket connection");
+        }
+
+        ws.onmessage = async (event) => {
+          let payloadAny: unknown;
+          try {
+            payloadAny = JSON.parse(String(event.data));
+          } catch {
+            return;
+          }
+          if (!payloadAny || typeof payloadAny !== "object" || Array.isArray(payloadAny)) {
+            return;
+          }
+          const payload = payloadAny as Record<string, unknown>;
+          const tx = String(payload.transaction ?? "");
+          if (tx && pending.has(tx)) {
+            const entry = pending.get(tx);
+            if (!entry) {
+              return;
+            }
+            window.clearTimeout(entry.timer);
+            pending.delete(tx);
+            if (payload.janus === "error") {
+              const error = payload.error as { code?: number; reason?: string } | undefined;
+              const apiCode = normalizeCodeToken(error?.code ?? "unknown");
+              const reason = normalizeSnippet(error?.reason ?? "");
+              entry.reject(
+                new JanusStepError(
+                  entry.step,
+                  `${entry.step}_janus_error_${apiCode}`,
+                  reason || `Janus reported error code ${error?.code ?? "unknown"}`
+                )
+              );
+              return;
+            }
+            entry.resolve(payload);
+            return;
+          }
+
+          const eventSender = Number(payload.sender ?? -1);
+          if (
+            payload.janus === "event" &&
+            eventSender === janusHandleRef.current &&
+            payload.jsep &&
+            typeof payload.jsep === "object" &&
+            janusPcRef.current
+          ) {
+            if (!sawOffer) {
+              sawOffer = true;
+              pushJanusDiagnostic("offer", "ok", "Received remote SDP offer", true);
+            }
+            const remote = payload.jsep as RTCSessionDescriptionInit;
+            try {
+              await janusPcRef.current.setRemoteDescription(remote);
+            } catch (err: unknown) {
+              const reason = err instanceof Error ? err.message : "setRemoteDescription failed";
+              firstTrackFailure = new JanusStepError("offer", "offer_set_remote_failed", reason);
+              pushJanusDiagnostic("offer", "offer_set_remote_failed", reason, false);
+              settleFirstTrack(false);
+              return;
+            }
+            try {
+              const answer = await janusPcRef.current.createAnswer();
+              await janusPcRef.current.setLocalDescription(answer);
+            } catch (err: unknown) {
+              const reason = err instanceof Error ? err.message : "create/set local answer failed";
+              firstTrackFailure = new JanusStepError("answer", "answer_local_description_failed", reason);
+              pushJanusDiagnostic("answer", "answer_local_description_failed", reason, false);
+              settleFirstTrack(false);
+              return;
+            }
+            try {
+              await sendWs(
+                {
+                  janus: "message",
+                  body: { request: "start" },
+                  jsep: janusPcRef.current.localDescription,
+                  session_id: janusSessionRef.current ?? undefined,
+                  handle_id: janusHandleRef.current ?? undefined
+                },
+                "answer"
+              );
+              if (!sentAnswer) {
+                sentAnswer = true;
+                pushJanusDiagnostic("answer", "ok", "Submitted local SDP answer to Janus", true);
+              }
+            } catch (err: unknown) {
+              const normalized = err instanceof JanusStepError
+                ? err
+                : new JanusStepError(
+                    "answer",
+                    "answer_ws_send_failed",
+                    err instanceof Error ? err.message : "Failed to send Janus answer"
+                  );
+              firstTrackFailure = normalized;
+              pushJanusDiagnostic(normalized.step, normalized.code, normalized.message, false);
+              settleFirstTrack(false);
+            }
+            return;
+          }
+
+          if (
+            payload.janus === "trickle" &&
+            eventSender === janusHandleRef.current &&
+            payload.candidate &&
+            janusPcRef.current
+          ) {
+            const candidate = payload.candidate as { completed?: boolean; candidate?: string };
+            try {
+              await janusPcRef.current.addIceCandidate(candidate.completed ? null : (candidate as RTCIceCandidateInit));
+            } catch {
+              // Ignore invalid trickle candidates.
+            }
+          }
+        };
+
+        ws.onclose = () => {
+          if (signal.aborted) {
+            return;
+          }
+          const err = new JanusStepError("offer", "ws_closed", "Janus WebSocket closed");
+          closePending(err);
+          if (!resolvedFirstTrack) {
+            firstTrackFailure = err;
+            pushJanusDiagnostic(err.step, err.code, err.message, false);
+            settleFirstTrack(false);
+          }
+        };
+
+        const created = await sendWs({ janus: "create" }, "create");
+        sessionId = Number((created.data as { id?: number } | undefined)?.id ?? -1);
+        if (!Number.isFinite(sessionId) || sessionId <= 0) {
+          throw new JanusStepError("create", "create_invalid_session_id", "Janus create response missing valid session id");
+        }
+        pushJanusDiagnostic("create", "ok", `session_id=${sessionId}`, true);
+
+        const attached = await sendWs({ janus: "attach", plugin: "janus.plugin.streaming", session_id: sessionId }, "attach");
+        handleId = Number((attached.data as { id?: number } | undefined)?.id ?? -1);
+        if (!Number.isFinite(handleId) || handleId <= 0) {
+          throw new JanusStepError("attach", "attach_invalid_handle_id", "Janus attach response missing valid handle id");
+        }
+        pushJanusDiagnostic("attach", "ok", `handle_id=${handleId}`, true);
+
+        janusSessionRef.current = sessionId;
+        janusHandleRef.current = handleId;
+        const pc = new RTCPeerConnection();
+        janusPcRef.current = pc;
+
+        const firstTrack = new Promise<boolean>((resolve) => {
+          firstTrackResolve = resolve;
+          firstTrackTimeout = window.setTimeout(() => {
+            if (!sawOffer) {
+              firstTrackFailure = new JanusStepError(
+                "offer",
+                "offer_not_received",
+                `No Janus SDP offer received within ${Math.round(janusFirstTrackTimeoutMs)}ms`
+              );
+            } else if (sentAnswer) {
+              firstTrackFailure = new JanusStepError(
+                "first-track",
+                "signal_ok_media_failed",
+                `Signaling completed but no media track received within ${Math.round(janusFirstTrackTimeoutMs)}ms`
+              );
+            } else {
+              firstTrackFailure = new JanusStepError(
+                "answer",
+                "answer_not_completed",
+                `Offer received but local answer was not completed within ${Math.round(janusFirstTrackTimeoutMs)}ms`
+              );
+            }
+            pushJanusDiagnostic(firstTrackFailure.step, firstTrackFailure.code, firstTrackFailure.message, false);
+            settleFirstTrack(false);
+          }, janusFirstTrackTimeoutMs);
+
+          pc.ontrack = (event) => {
+            if (!event.streams[0]) {
+              return;
+            }
+            settleFirstTrack(true);
+            showVideo();
+            video.srcObject = event.streams[0];
+            video.play().catch(() => undefined);
+            if (janusTtffMsRef.current === null && janusConnectStartedAtRef.current !== null) {
+              janusTtffMsRef.current = Math.max(0, performance.now() - janusConnectStartedAtRef.current);
+            }
+            pushJanusDiagnostic("first-track", "ok", "Remote media track received", true);
+            transportModeRef.current = "janus";
+            setTransportMode("janus");
+            setTransportError(null);
+          };
+        });
+
+        pc.onicecandidate = (event) => {
+          const sid = janusSessionRef.current;
+          const hid = janusHandleRef.current;
+          if (!sid || !hid || signal.aborted) {
+            return;
+          }
+          void sendWs(
+            {
+              janus: "trickle",
+              candidate: event.candidate ?? { completed: true },
+              session_id: sid,
+              handle_id: hid
+            },
+            "answer"
+          ).catch(() => undefined);
+        };
+
+        await sendWs(
+          {
+            janus: "message",
+            body: { request: "watch", id: resolvedJanusMountpoint },
+            session_id: sessionId,
+            handle_id: handleId
+          },
+          "watch"
+        );
+        pushJanusDiagnostic("watch", "ok", `mountpoint=${resolvedJanusMountpoint}`, true);
+
+        janusKeepaliveRef.current = window.setInterval(() => {
+          if (signal.aborted || !janusSessionRef.current) {
+            return;
+          }
+          void sendWs({ janus: "keepalive", session_id: janusSessionRef.current }, "watch").catch(() => undefined);
+        }, 25000);
+
+        const gotTrack = await firstTrack;
+        if (!gotTrack) {
+          if (firstTrackFailure) {
+            throw firstTrackFailure;
+          }
+          throw new JanusStepError(
+            "first-track",
+            "first_track_timeout",
+            `No media track received within ${Math.round(janusFirstTrackTimeoutMs)}ms`
+          );
+        }
+        return { ok: true, error: "" };
+      } catch (err: unknown) {
+        const normalizedError =
+          err instanceof JanusStepError
+            ? err
+            : new JanusStepError(
+                "first-track",
+                "janus_ws_negotiation_failed",
+                err instanceof Error ? err.message : "Janus WS negotiation failed"
+              );
+        if (!(err instanceof JanusStepError)) {
+          pushJanusDiagnostic(normalizedError.step, normalizedError.code, normalizedError.message, false);
+        }
+        closeTransport();
+        return {
+          ok: false,
+          error: `${normalizedError.code} [${normalizedError.step}] ${normalizedError.message}`
+        };
+      }
+    };
+
+    const startJanusTransport = async (): Promise<{ ok: boolean; error: string }> => {
+      if (resolvedJanusWsUrl) {
+        return startJanusTransportWs();
+      }
+      janusTransportRef.current = "http";
+      return startJanusTransportHttp();
     };
 
     const startWsJpegTransport = async (): Promise<{ ok: boolean; error: string }> => {
@@ -623,7 +1286,7 @@ export function VideoCanvas({
 
           socket.onmessage = (event) => {
             const now = performance.now();
-            if (now - lastRenderedAt < 90) {
+            if (receivedFrame && wsJpegRenderMinIntervalMs > 0 && now - lastRenderedAt < wsJpegRenderMinIntervalMs) {
               return;
             }
             lastRenderedAt = now;
@@ -691,11 +1354,11 @@ export function VideoCanvas({
       setTransportMode("connecting");
 
       const failures: string[] = [];
-      if (!configuredTransportPlan.length) {
+      if (!effectiveTransportPlan.length) {
         failures.push("No transports configured");
       }
 
-      for (const candidate of configuredTransportPlan) {
+      for (const candidate of effectiveTransportPlan) {
         const result = await attemptTransport(candidate);
         if (cancelled) {
           return;
@@ -720,14 +1383,17 @@ export function VideoCanvas({
     };
   }, [
     active,
-    configuredTransportPlan,
+    effectiveTransportPlan,
     configuredTransportPlanLabel,
     disableBackendVideo,
     disableJanus,
     disableWebRtc,
+    janusFirstTrackTimeoutMs,
     resolvedJanusHttpUrl,
+    resolvedJanusWsUrl,
     resolvedJanusMountpoint,
-    resolvedWsJpegUrl
+    resolvedWsJpegUrl,
+    wsJpegRenderMinIntervalMs
   ]);
 
   useEffect(() => {
